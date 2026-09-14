@@ -47,7 +47,28 @@ class talks to C, so they are the same in both modes. Where a fact genuinely
 differs, the contract carries it as a value (see Transport below), never as a
 second type.
 
-The bridge renders one Java file, `Native.java`, instead of `jni_glue.c`.
+The bridge renders two files instead of `jni_glue.c`: `Native.java` and a
+thin pointer-ABI C shim, `native_image_glue.c`.
+
+### Why a C shim is still needed (spike finding)
+
+`@CFunction` cannot pass or return structs by value. The C ABI bridge does so
+pervasively: owned buffers (`FfiBuf_u8`, 32 bytes) and direct records return
+by value, direct records and `BoltFFICallbackHandle` (16 bytes) pass by value,
+and `FfiStatus` is a one-field struct. Two-word structs happen to travel in
+two registers on arm64 and x86_64 SysV, which the spike confirmed, but
+anything larger uses `sret` or stack memory that Java cannot express, and
+Windows x64 differs again.
+
+The shim therefore wraps every C export whose signature carries a by-value
+struct in a `boltffi_ni_*` function that takes and returns pointers only:
+`void boltffi_ni_echo_point(const Point *in, Point *out)`,
+`void boltffi_ni_fetch(FfiBuf_u8 *out, ...)`, `int32_t` for `FfiStatus`.
+Exports that are already scalar or pointer only are called directly. Callback
+vtables are filled by Java, so `create_handle` is not called from Java.
+
+The shim is mechanical, has no JNI or JVM dependency, and is compiled into the
+same static library by `pack java`, which already compiles `jni_glue.c`.
 
 ### Capabilities
 
@@ -61,8 +82,10 @@ mismatched pairings at build time as it does today.
 Package-private `final class Native` in the host package, containing:
 
 1. `@CContext(Native.Directives.class)` with a `Directives` class returning
-   the generated header (`"<boltffi.h>"` via search path) and
-   `@CLibrary(value = <lib>, requireStatic = true)`.
+   the generated header (`"<boltffi.h>"`) plus `getOptions()` returning
+   `-I<dir>` read from the build-time system property `boltffi.include`, and
+   `@CLibrary(value = <lib>, requireStatic = true)`. `-H:CLibraryPath` is for
+   libraries only; header include paths must come from the directives.
 2. A nested `Lib` holder of `@CFunction` declarations, one per C bridge
    export, with C-typed parameters (`long`, `int`, `PointerBase` subclasses,
    `CCharPointer`). Functions whose parameter groups contain no callback,
@@ -83,10 +106,23 @@ Package-private `final class Native` in the host package, containing:
    address to the C `create_handle` function as the handle. `free` slots free
    the cell.
 6. A custom `@CEntryPointOptions(prologue = AttachPrologue.class)` whose
-   prologue reads `isolate` from the `HandleCell` at parameter 0 without
-   touching the Java heap and calls `CEntryPointActions.enterAttachThread`.
-   Foreign Rust threads attach on first upcall and stay attached. Epilogue is
-   the default leave.
+   prologue `static int enter(HandleCell cell)` reads `isolate` from the cell
+   at parameter 0 without touching the Java heap and returns
+   `CEntryPointActions.enterAttachThread(isolate, true)`. This mirrors the
+   prologue Native Image's own JNI `AttachCurrentThread` uses. Foreign Rust
+   threads attach on first upcall and stay attached. Epilogue is the default
+   leave. Verified by the spike on GraalVM 25 with a Rust `std::thread`.
+
+   These live in internal modules in GraalVM 25: `CEntryPointOptions`,
+   `CEntryPointActions` in `com.oracle.svm.guest.staging.c.function`
+   (`org.graalvm.nativeimage.guest.staging`) and `Uninterruptible` in
+   `com.oracle.svm.shared` (`org.graalvm.nativeimage.shared`). The generated
+   `native-image.properties` carries the three `--add-exports` flags, and the
+   `javac` classpath needs `lib/svm/builder/svm-guest-staging.jar` and
+   `svm-shared.jar`. Elide already builds against these internals. The
+   `staging` name signals Oracle intends to promote them; the bridge isolates
+   every use behind one generated `NativeImageSupport` class so a package
+   rename is a one-line template change.
 
 Host-rendered callback dispatchers (`Native`-adjacent static methods that map
 a token to a Java object and invoke it) are called directly from the
@@ -115,10 +151,13 @@ slots in here.
 
 `pack java` gains a `native-image` output mode:
 
-- Builds the Rust crate as `staticlib`, stages `libboltffi_<crate>.a` and the
-  generated header under `native/`.
+- Builds the Rust crate as `staticlib`, compiles `native_image_glue.c` into a
+  second static archive, and stages both plus the generated header under
+  `native/`.
 - Emits `META-INF/native-image/<group>/<artifact>/native-image.properties`
-  with `Args = -H:CLibraryPath=${.}/../../../../native`.
+  with `Args = -H:CLibraryPath=${.}/../../../../native
+  -Dboltffi.include=${.}/../../../../native` plus the three `--add-exports`
+  flags above.
 - Emits no JNI glue and no `jni-config.json`.
 
 Config: `[targets.java.jvm] binding = "jni" | "native-image"`.
@@ -144,25 +183,30 @@ Config: `[targets.java.jvm] binding = "jni" | "native-image"`.
   foreign-thread upcall case.
 - Existing JNI snapshot and runtime tests must stay green.
 
-## Spike
+## Spike (done 2026-09-14)
 
-Before the bridge is written, a throwaway image under the session scratchpad
-proves two things with the local GraalVM 25 toolchain:
+A throwaway image under the session scratchpad, built with the local GraalVM
+25.3 toolchain, proved:
 
-1. `@CFunction` into a Rust `staticlib` with `@CLibrary(requireStatic = true)`.
-2. A `@CEntryPoint` invoked from a Rust `std::thread` via a function pointer
-   whose first argument is a `HandleCell*`, using the attach prologue.
+1. `@CFunction(transition = NO_TRANSITION)` into a Rust `staticlib` linked via
+   `@CLibrary(requireStatic = true)` and `-H:CLibraryPath`.
+2. A `@CEntryPoint` invoked synchronously and then three times from a Rust
+   `std::thread`, through a vtable whose first argument is a `HandleCell*`,
+   using the attach prologue. The foreign thread appeared as `System-0`,
+   `free` ran on it, and the process exited cleanly.
+3. A 16-byte by-value struct parameter is ABI-equivalent to two scalar
+   parameters on arm64. Larger by-value structs are not expressible, hence
+   the shim.
 
-The spike's output is a recommendation on prologue mechanics, not code that
-is kept.
+Nothing from the spike is kept.
 
 ## Work order
 
 1. Spike (above).
 2. `BridgeCapability::NativeImageC`, `JvmBinding`, host seam, contract
    `Transport` and `owner_rendered_by_bridge`.
-3. `NativeImageBridge` skeleton: directives, `Lib` declarations, sync scalar
-   and record wrappers, snapshot tests.
+3. `NativeImageBridge` skeleton: directives, `Lib` declarations, C shim for
+   by-value shapes, sync scalar and record wrappers, snapshot tests.
 4. Upcalls: `HandleCell`, prologue, callback vtables, closures, then streams
    and async completions.
 5. Encoded bytes, owned buffers, status and error translation.
