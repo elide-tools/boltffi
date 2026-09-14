@@ -27,8 +27,8 @@ mod template;
 pub use bridge::{JniBridge, JniHeaderStyle};
 pub(crate) use contract::ClosureRecordArgument;
 pub use contract::{
-    BytesParameter, BytesWriteback, CallbackArgument, CallbackBytesArgument, CallbackCParameter,
-    CallbackClosureArgument, CallbackClosureHandle, CallbackClosureReturn,
+    BridgeOwner, BytesParameter, BytesWriteback, CallbackArgument, CallbackBytesArgument,
+    CallbackCParameter, CallbackClosureArgument, CallbackClosureHandle, CallbackClosureReturn,
     CallbackCompletionArgument, CallbackCompletionInvoker, CallbackCompletionPayload,
     CallbackCompletionPayloadValue, CallbackDirectVectorArgument, CallbackHandleArgument,
     CallbackHandleClosureReturn, CallbackHandleCompletion, CallbackHandleLifecycle,

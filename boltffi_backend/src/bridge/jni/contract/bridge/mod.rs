@@ -31,6 +31,16 @@ use super::{
 };
 use index::SourceIndex;
 
+/// Which layer renders the members of the JVM native owner class.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum BridgeOwner {
+    /// The host renders `static native` declarations; the bridge renders JNI C glue.
+    Host,
+    /// The bridge renders a Java class that host code calls directly.
+    NativeImage,
+}
+
 /// A complete JNI bridge contract for one generated C source file.
 ///
 /// The value is built from one `CBridgeContract` and is ready for rendering. It
@@ -55,12 +65,24 @@ pub struct JniBridgeContract {
     methods: Vec<NativeMethod>,
     streams: Vec<StreamProtocolMethods>,
     source_index: SourceIndex,
+    owner: BridgeOwner,
+    native_image_class: Option<JvmClassPath>,
 }
 
 impl JniBridgeContract {
     /// Returns the JVM class that owns generated native methods.
     pub fn class(&self) -> &JvmClassPath {
         &self.class
+    }
+
+    /// Returns who renders the native owner class members.
+    pub const fn owner(&self) -> BridgeOwner {
+        self.owner
+    }
+
+    /// Returns the bridge-rendered Java class in Native Image mode.
+    pub fn native_image_class(&self) -> Option<&JvmClassPath> {
+        self.native_image_class.as_ref()
     }
 
     /// Returns the generated JNI source path.
@@ -148,3 +170,66 @@ impl BridgeContract for JniBridgeContract {
 }
 
 impl sealed::BridgeContract for JniBridgeContract {}
+
+#[cfg(test)]
+mod tests {
+    use boltffi_ast::PackageInfo;
+    use boltffi_binding::lower;
+
+    use super::{BridgeOwner, JniBridgeContract};
+    use crate::{
+        bridge::{
+            c::CBridgeContract,
+            jni::{JniHeaderStyle, JvmClassPath},
+        },
+        core::{BridgeCapability, BridgeContract, FilePath},
+    };
+
+    fn c_bridge() -> CBridgeContract {
+        let file = syn::parse_str("#[export] pub fn ping() {}").unwrap();
+        let source = boltffi_scan::scan_file(file, PackageInfo::new("demo", None)).unwrap();
+        let bindings = lower::<boltffi_binding::Native>(&source).unwrap();
+        CBridgeContract::from_bindings(&bindings, FilePath::new("demo.h").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn jni_contract_is_host_owned() {
+        let class = JvmClassPath::new("com.demo", "Native").unwrap();
+        let contract = JniBridgeContract::from_c_bridge(
+            class,
+            FilePath::new("jni_glue.c").unwrap(),
+            JniHeaderStyle::Quoted,
+            &c_bridge(),
+        )
+        .unwrap();
+        assert_eq!(contract.owner(), BridgeOwner::Host);
+        assert!(contract.native_image_class().is_none());
+        assert!(
+            contract
+                .capabilities()
+                .status(BridgeCapability::Jni)
+                .is_stable()
+        );
+    }
+
+    #[test]
+    fn native_image_contract_is_bridge_owned() {
+        let class = JvmClassPath::new("com.demo", "Native").unwrap();
+        let ni = JvmClassPath::new("com.demo", "BoltFFINativeImage").unwrap();
+        let contract = JniBridgeContract::for_native_image(class, ni.clone(), &c_bridge()).unwrap();
+        assert_eq!(contract.owner(), BridgeOwner::NativeImage);
+        assert_eq!(contract.native_image_class(), Some(&ni));
+        assert!(
+            contract
+                .capabilities()
+                .status(BridgeCapability::NativeImageC)
+                .is_stable()
+        );
+        assert!(
+            !contract
+                .capabilities()
+                .status(BridgeCapability::Jni)
+                .is_stable()
+        );
+    }
+}

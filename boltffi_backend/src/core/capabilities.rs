@@ -50,6 +50,8 @@ pub enum BridgeCapability {
     PythonExtension,
     /// N-API surface.
     Napi,
+    /// GraalVM Native Image C API surface (`@CFunction` downcalls, `@CEntryPoint` upcalls).
+    NativeImageC,
 }
 
 /// Support state for one backend capability.
@@ -235,6 +237,11 @@ where
     /// Returns whether the set contains no requirements.
     pub fn is_empty(&self) -> bool {
         self.capabilities.is_empty()
+    }
+
+    /// Returns whether the set requires a capability.
+    pub fn contains(&self, capability: C) -> bool {
+        self.capabilities.contains(&capability)
     }
 }
 

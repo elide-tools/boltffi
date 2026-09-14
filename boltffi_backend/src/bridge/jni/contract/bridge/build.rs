@@ -23,8 +23,9 @@ use crate::{
 };
 
 use super::{
-    CallbackCompletionInvoker, CallbackHandleLifecycle, CallbackRegistration, ClosureRegistration,
-    JniBridgeContract, NativeMethod, StreamProtocolMethods, SuccessOutWriter, index::SourceIndex,
+    BridgeOwner, CallbackCompletionInvoker, CallbackHandleLifecycle, CallbackRegistration,
+    ClosureRegistration, JniBridgeContract, NativeMethod, StreamProtocolMethods, SuccessOutWriter,
+    index::SourceIndex,
 };
 
 impl JniBridgeContract {
@@ -34,6 +35,47 @@ impl JniBridgeContract {
         source_path: FilePath,
         header_style: JniHeaderStyle,
         c_bridge: &c::CBridgeContract,
+    ) -> Result<Self> {
+        Self::build(
+            class,
+            source_path,
+            header_style,
+            c_bridge,
+            BridgeCapability::Jni,
+            BridgeOwner::Host,
+            None,
+        )
+    }
+
+    /// Builds the JVM contract for the Native Image bridge.
+    ///
+    /// The Native Image bridge renders Java instead of JNI C glue, so the
+    /// contract advertises `NativeImageC` rather than `Jni` and names the Java
+    /// class host code calls directly.
+    pub fn for_native_image(
+        class: JvmClassPath,
+        native_image_class: JvmClassPath,
+        c_bridge: &c::CBridgeContract,
+    ) -> Result<Self> {
+        Self::build(
+            class,
+            FilePath::new("BoltFFINativeImage.java")?,
+            JniHeaderStyle::SearchPath,
+            c_bridge,
+            BridgeCapability::NativeImageC,
+            BridgeOwner::NativeImage,
+            Some(native_image_class),
+        )
+    }
+
+    fn build(
+        class: JvmClassPath,
+        source_path: FilePath,
+        header_style: JniHeaderStyle,
+        c_bridge: &c::CBridgeContract,
+        capability: BridgeCapability,
+        owner: BridgeOwner,
+        native_image_class: Option<JvmClassPath>,
     ) -> Result<Self> {
         let handle_method_callbacks = Self::handle_method_callbacks(c_bridge);
         let closures = ClosureRegistration::from_c_bridge(
@@ -85,10 +127,7 @@ impl JniBridgeContract {
             .collect::<Result<Vec<_>>>()?;
         let source_index = SourceIndex::new(&callbacks, &methods, &streams)?;
         Ok(Self {
-            capabilities: c_bridge
-                .capabilities()
-                .clone()
-                .stable(BridgeCapability::Jni),
+            capabilities: c_bridge.capabilities().clone().stable(capability),
             c_header: HeaderInclude::from_files(&source_path, c_bridge.header_path())?,
             header_style,
             free_buffer: Identifier::parse(c_bridge.support().buffer_free()?.name())?,
@@ -103,6 +142,8 @@ impl JniBridgeContract {
             closures,
             class,
             source_path,
+            owner,
+            native_image_class,
         })
     }
 

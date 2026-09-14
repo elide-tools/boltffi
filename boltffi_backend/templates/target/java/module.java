@@ -2,7 +2,7 @@ package {{ package }};
 {%- for import in imports %}
 
 {{ import }}
-{%- endfor %}
+{%- endfor %}{% if native_class %}
 
 final class {{ native_owner }} {
 {{ loader }}
@@ -13,6 +13,7 @@ final class {{ native_owner }} {
 {{ method }}
 {%- endfor %}
 }
+{%- endif %}
 {%- for helper in helpers %}
 
 {{ helper }}

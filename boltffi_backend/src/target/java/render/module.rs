@@ -23,6 +23,7 @@ struct ModuleTemplate<'module> {
     package: &'module JavaPackage,
     file: &'module JavaFile,
     native_owner: &'module TypeIdentifier,
+    native_class: bool,
     imports: Vec<MemberSource>,
     loader: MemberSource,
     native_methods: Vec<MemberSource>,
@@ -69,6 +70,7 @@ impl<'host, 'bridge, 'decl> Module<'host, 'bridge, 'decl> {
         let host = self.host;
         let native_owner = host.native_owner();
         let runtime_owner = host.runtime_owner();
+        let native_class = host.renders_native_class(self.bridge);
         self.validate_bridge_owner(&native_owner)?;
         let closures = Closures::from_declarations(
             &self.declarations,
@@ -106,6 +108,7 @@ impl<'host, 'bridge, 'decl> Module<'host, 'bridge, 'decl> {
             package: host.package(),
             file: host.file(),
             native_owner: &native_owner,
+            native_class,
             imports: chunks.imports(),
             loader: MemberSource::rendered(loader.render()?),
             native_methods: chunks.forwards(),
@@ -118,7 +121,7 @@ impl<'host, 'bridge, 'decl> Module<'host, 'bridge, 'decl> {
             contents,
         )];
         files.append(&mut declaration_files);
-        if let Some(runtime) = loader.desktop_source(host.package())? {
+        if native_class && let Some(runtime) = loader.desktop_source(host.package())? {
             files.push(GeneratedFile::new(
                 FilePath::new(host.runtime_file().path(host.package()))?,
                 runtime,
@@ -133,10 +136,14 @@ impl<'host, 'bridge, 'decl> Module<'host, 'bridge, 'decl> {
 
     fn validate_bridge_owner(&self, native_owner: &TypeIdentifier) -> Result<()> {
         let expected = JvmClassPath::new(self.host.package().to_string(), native_owner.as_str())?;
-        match self.bridge.class() == &expected {
+        let actual = self
+            .bridge
+            .native_image_class()
+            .unwrap_or_else(|| self.bridge.class());
+        match actual == &expected {
             true => Ok(()),
             false => Err(JavaHost::broken_bridge_contract(
-                "JNI owner class matches the Java native owner",
+                "bridge owner class matches the Java native owner",
             )),
         }
     }

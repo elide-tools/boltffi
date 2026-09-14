@@ -19,7 +19,7 @@ use boltffi_binding::{
 use crate::{
     bridge::{
         c::CBridge,
-        jni::{JniBridge, JniBridgeContract},
+        jni::{BridgeOwner, JniBridge, JniBridgeContract},
     },
     core::{
         BindingCapability, BridgeCapability, BridgeLayer, CapabilityRequirements, CoverageMode,
@@ -35,6 +35,17 @@ use render::{Call, Callback, Class, Constant, Enumeration, ErasedSignature, Modu
 use syntax::{Syntax, TypeIdentifier};
 pub use version::JavaVersion;
 
+/// How generated Java reaches the C ABI.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum JvmBinding {
+    /// JNI glue compiled into a shared library and loaded at runtime.
+    #[default]
+    Jni,
+    /// GraalVM Native Image C API, statically linked into the image.
+    NativeImage,
+}
+
 /// Java host renderer for one generated JNI owner class.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -46,11 +57,14 @@ pub struct JavaHost {
     jni_source: PathBuf,
     native_libraries: NativeLibraries,
     java_version: JavaVersion,
+    binding: JvmBinding,
 }
 
 impl JavaHost {
     const NATIVE_CLASS: &'static str = "Native";
     const RUNTIME_CLASS: &'static str = "BoltFFINativeRuntime";
+    /// Java class rendered by the Native Image bridge and called directly by host code.
+    pub const NATIVE_IMAGE_CLASS: &'static str = "BoltFFINativeImage";
     const TARGET: &'static str = "java";
 
     /// Creates a Java 8 host renderer.
@@ -69,6 +83,7 @@ impl JavaHost {
         let runtime_file = JavaFile::parse_for(Self::RUNTIME_CLASS, version)?;
         if file.as_str() == Self::NATIVE_CLASS
             || file.as_str().eq_ignore_ascii_case(runtime_file.as_str())
+            || file.as_str().eq_ignore_ascii_case(Self::NATIVE_IMAGE_CLASS)
         {
             return Err(Error::JavaNameCollision {
                 scope: package.to_string(),
@@ -83,7 +98,27 @@ impl JavaHost {
             jni_source: PathBuf::from("jni/jni_glue.c"),
             native_libraries: NativeLibraries::boltffi()?,
             java_version: version,
+            binding: JvmBinding::default(),
         })
+    }
+
+    /// Selects how generated Java reaches the C ABI.
+    ///
+    /// Native Image mode statically links the Rust library, so desktop and
+    /// Android library loading is disabled.
+    pub fn binding(mut self, binding: JvmBinding) -> Self {
+        self.binding = binding;
+        if matches!(binding, JvmBinding::NativeImage) {
+            self.native_libraries = self
+                .native_libraries
+                .with_desktop_loader(JavaDesktopLoader::None);
+        }
+        self
+    }
+
+    /// Returns how generated Java reaches the C ABI.
+    pub const fn jvm_binding(&self) -> JvmBinding {
+        self.binding
     }
 
     /// Selects the generated C header path.
@@ -156,6 +191,9 @@ impl JavaHost {
         bindings: &Bindings<Native>,
         mode: crate::core::CoverageMode,
     ) -> Result<GeneratedOutput> {
+        if matches!(self.binding, JvmBinding::NativeImage) {
+            return Err(Self::unsupported("native image binding"));
+        }
         match mode {
             CoverageMode::Complete => self.target()?.render(bindings),
             CoverageMode::Partial => {
@@ -182,8 +220,22 @@ impl JavaHost {
         self.java_version
     }
 
+    /// Returns the Java class host code calls for native entry points.
+    ///
+    /// Under JNI this is the host-rendered `Native` class. Under Native Image
+    /// host code calls the bridge-rendered class directly.
     fn native_owner(&self) -> TypeIdentifier {
-        TypeIdentifier::known(Self::NATIVE_CLASS, self.java_version)
+        match self.binding {
+            JvmBinding::Jni => TypeIdentifier::known(Self::NATIVE_CLASS, self.java_version),
+            JvmBinding::NativeImage => {
+                TypeIdentifier::known(Self::NATIVE_IMAGE_CLASS, self.java_version)
+            }
+        }
+    }
+
+    /// Returns whether the host renders its own `Native` class and loader.
+    fn renders_native_class(&self, bridge: &JniBridgeContract) -> bool {
+        matches!(bridge.owner(), BridgeOwner::Host)
     }
 
     fn runtime_owner(&self) -> TypeIdentifier {
@@ -397,7 +449,10 @@ impl host::HostBackend for JavaHost {
     }
 
     fn bridge_capabilities(&self) -> CapabilityRequirements<BridgeCapability> {
-        CapabilityRequirements::new().require(BridgeCapability::Jni)
+        CapabilityRequirements::new().require(match self.binding {
+            JvmBinding::Jni => BridgeCapability::Jni,
+            JvmBinding::NativeImage => BridgeCapability::NativeImageC,
+        })
     }
 
     fn preflight_coverage(
@@ -509,3 +564,35 @@ impl host::HostBackend for JavaHost {
 }
 
 impl sealed::HostBackend for JavaHost {}
+
+#[cfg(test)]
+mod tests {
+    use super::{JavaHost, JvmBinding};
+    use crate::core::{BridgeCapability, host::HostBackend};
+
+    #[test]
+    fn jni_binding_requires_jni_capability() {
+        let host = JavaHost::new("com.demo", "Demo").unwrap();
+        let required = host.bridge_capabilities();
+        assert!(required.contains(BridgeCapability::Jni));
+        assert!(!required.contains(BridgeCapability::NativeImageC));
+    }
+
+    #[test]
+    fn native_image_binding_requires_native_image_capability() {
+        let host = JavaHost::new("com.demo", "Demo")
+            .unwrap()
+            .binding(JvmBinding::NativeImage);
+        let required = host.bridge_capabilities();
+        assert!(required.contains(BridgeCapability::NativeImageC));
+        assert!(!required.contains(BridgeCapability::Jni));
+        assert_eq!(host.native_owner().as_str(), JavaHost::NATIVE_IMAGE_CLASS);
+        assert!(!host.native_libraries().desktop_loader().loads_bundled());
+    }
+
+    #[test]
+    fn native_image_class_name_is_reserved() {
+        assert!(JavaHost::new("com.demo", "BoltFFINativeImage").is_err());
+        assert!(JavaHost::new("com.demo", "boltffinativeimage").is_err());
+    }
+}
