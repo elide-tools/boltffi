@@ -69,15 +69,72 @@
             return com.oracle.svm.guest.staging.c.function.CEntryPointActions.enterAttachThread(cell.isolate(), true);
         }
     }
+
+    /** Value an upcall returns when the attach prologue fails. */
+    static final class BailoutBoolean implements com.oracle.svm.guest.staging.c.function.CEntryPointOptions.PrologueBailout {
+        @com.oracle.svm.shared.Uninterruptible(reason = "Entry point bailout runs outside the isolate.")
+        public static boolean bailout(int prologueResult) { return false; }
+    }
+
+    /** Value an upcall returns when the attach prologue fails. */
+    static final class BailoutByte implements com.oracle.svm.guest.staging.c.function.CEntryPointOptions.PrologueBailout {
+        @com.oracle.svm.shared.Uninterruptible(reason = "Entry point bailout runs outside the isolate.")
+        public static byte bailout(int prologueResult) { return (byte) 0; }
+    }
+
+    /** Value an upcall returns when the attach prologue fails. */
+    static final class BailoutShort implements com.oracle.svm.guest.staging.c.function.CEntryPointOptions.PrologueBailout {
+        @com.oracle.svm.shared.Uninterruptible(reason = "Entry point bailout runs outside the isolate.")
+        public static short bailout(int prologueResult) { return (short) 0; }
+    }
+
+    /** Value an upcall returns when the attach prologue fails. */
+    static final class BailoutLong implements com.oracle.svm.guest.staging.c.function.CEntryPointOptions.PrologueBailout {
+        @com.oracle.svm.shared.Uninterruptible(reason = "Entry point bailout runs outside the isolate.")
+        public static long bailout(int prologueResult) { return 0L; }
+    }
+
+    /** Value an upcall returns when the attach prologue fails. */
+    static final class BailoutFloat implements com.oracle.svm.guest.staging.c.function.CEntryPointOptions.PrologueBailout {
+        @com.oracle.svm.shared.Uninterruptible(reason = "Entry point bailout runs outside the isolate.")
+        public static float bailout(int prologueResult) { return 0.0f; }
+    }
+
+    /** Value an upcall returns when the attach prologue fails. */
+    static final class BailoutDouble implements com.oracle.svm.guest.staging.c.function.CEntryPointOptions.PrologueBailout {
+        @com.oracle.svm.shared.Uninterruptible(reason = "Entry point bailout runs outside the isolate.")
+        public static double bailout(int prologueResult) { return 0.0d; }
+    }
 {%- if contract.registers_callbacks() %}
 
-    static {
-        Lib.{{ contract.register_callbacks() }}();
+    private static volatile boolean callbacksRegistered = false;
+
+    /**
+     * Publishes the generated callback vtables to Rust exactly once.
+     *
+     * This class is initialized at image build time because it carries the
+     * `@CContext`, so the registration cannot run from a static initializer;
+     * it happens on the first handle a Java callback hands to Rust instead.
+     */
+    static void ensureCallbacksRegistered() {
+        if (!callbacksRegistered) {
+            registerCallbacks();
+        }
+    }
+
+    private static synchronized void registerCallbacks() {
+        if (!callbacksRegistered) {
+            Lib.{{ contract.register_callbacks() }}();
+            callbacksRegistered = true;
+        }
     }
 {%- endif %}
 
     /** Allocates the unmanaged cell Rust receives as a Java-owned callback handle. */
     static long newHandleCell(long token) {
+{%- if contract.registers_callbacks() %}
+        ensureCallbacksRegistered();
+{%- endif %}
         HandleCell cell = UnmanagedMemory.malloc(SizeOf.get(HandleCell.class));
         cell.isolate(CurrentIsolate.getIsolate());
         cell.token(token);

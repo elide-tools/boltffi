@@ -269,7 +269,26 @@ fn renders_callback_trampolines_and_vtable_registration() {
     assert!(out.contains("static void ___ListenerVTable_on_text(HandleCell __cell, org.graalvm.word.PointerBase text_ptr, long text_len) {"));
     assert!(out.contains("static boolean ___ListenerVTable_on_batch(HandleCell __cell, org.graalvm.word.PointerBase values_ptr, long values_len) {"));
     assert!(out.contains("static FfiBuf_u8 ___ListenerVTable_describe(uint64_t handle) {"));
-    assert!(out.contains("Lib.boltffi_ni_register_callbacks();"));
+    // registration is lazy: the `@CContext` class initializes at image build
+    // time, where the C library is not linked yet, so it cannot run in `<clinit>`
+    assert!(!out.contains("    static {\n        Lib.boltffi_ni_register_callbacks();"));
+    assert!(out.contains("    static void ensureCallbacksRegistered() {"));
+    assert!(out.contains("            Lib.boltffi_ni_register_callbacks();"));
+    assert!(out.contains(
+        "    static long newHandleCell(long token) {\n        ensureCallbacksRegistered();"
+    ));
+    // a custom prologue needs an explicit bailout for every non-`int`, non-`void` upcall
+    assert!(out.contains(
+        "CEntryPointOptions(prologue = AttachPrologue.class, prologueBailout = BailoutLong.class)"
+    ));
+    assert!(out.contains(
+        "CEntryPointOptions(prologue = AttachPrologue.class, prologueBailout = BailoutBoolean.class)"
+    ));
+    assert!(out.contains("static boolean bailout(int prologueResult) { return false; }"));
+    // `int` and `void` upcalls keep the automatic bailout
+    assert!(out.contains(
+        "CEntryPointOptions(prologue = AttachPrologue.class)\n    static int ___ListenerVTable_on_value("
+    ));
     // downcall passes the callback token through a stack BoltFFICallbackHandle
     assert!(out.contains("static int boltffi_function_demo_subscribe(long listener) {"));
     assert!(out.contains("CallbackHandle __cb_listener = StackValue.get(CallbackHandle.class);"));
