@@ -410,3 +410,47 @@ fn preserves_corrupted_live_recovery_evidence() {
     assert!(root.join(LIVE).join(Journal::FILE).is_file());
     assert!(!root.join("com/example/Demo.java").exists());
 }
+
+#[test]
+fn owns_native_image_sources_across_regeneration_and_binding_switches() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("java");
+    let output = output(&root);
+    let sources = [
+        ("com/example/BoltFFINativeImage.java", "bridge"),
+        ("native_image/boltffi.h", "header"),
+        ("native_image/native_image_glue.h", "glue header"),
+        ("native_image/native_image_glue.c", "glue source"),
+    ];
+    output.write(generated(&sources)).unwrap();
+    output.write(generated(&sources)).unwrap();
+    for (path, contents) in sources {
+        assert_eq!(fs::read_to_string(root.join(path)).unwrap(), contents);
+    }
+    fs::write(root.join("native_image/README.md"), "notes").unwrap();
+    output
+        .write(generated(&[("jni/boltffi.h", "JNI header")]))
+        .unwrap();
+    assert!(!root.join("native_image/boltffi.h").exists());
+    assert!(!root.join("native_image/native_image_glue.h").exists());
+    assert!(!root.join("native_image/native_image_glue.c").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("native_image/README.md")).unwrap(),
+        "notes"
+    );
+}
+
+#[test]
+fn refuses_unowned_native_image_sources() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("java");
+    fs::create_dir_all(root.join("native_image")).unwrap();
+    let handwritten = root.join("native_image/handwritten.c");
+    fs::write(&handwritten, "handwritten").unwrap();
+    let result = output(&root).write(generated(&[("native_image/boltffi.h", "generated")]));
+    assert!(
+        matches!(result, Err(crate::cli::CliError::CommandFailed { command, .. })
+        if command.contains("without manifest ownership"))
+    );
+    assert_eq!(fs::read_to_string(handwritten).unwrap(), "handwritten");
+}

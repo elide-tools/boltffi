@@ -342,7 +342,6 @@ final class BoltFFINativeImage {
             throw new RuntimeException("BoltFFI call failed");
         }
     }
-
     static void checkErrorBuffer(FfiBuf error) {
         if (error.ptr().isNonNull() || error.len() != 0) {
             throw new BoltFfiErrorBufferException(takeBuffer(error));

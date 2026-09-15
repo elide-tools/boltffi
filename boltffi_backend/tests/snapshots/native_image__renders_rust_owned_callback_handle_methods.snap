@@ -398,12 +398,6 @@ final class BoltFFINativeImage {
         }
     }
 
-    static void checkErrorBuffer(FfiBuf error) {
-        if (error.ptr().isNonNull() || error.len() != 0) {
-            throw new BoltFfiErrorBufferException(takeBuffer(error));
-        }
-    }
-
     /** Direct declarations of the C ABI (or its pointer-ABI shims). */
     static final class Lib {
         private Lib() {}

@@ -361,8 +361,11 @@
         }
     }
 
+{%- if contract.checks_error_buffer() %}
     static void checkErrorBuffer(FfiBuf error) {
         if (error.ptr().isNonNull() || error.len() != 0) {
             throw new BoltFfiErrorBufferException(takeBuffer(error));
         }
     }
+
+{%- endif %}

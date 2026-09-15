@@ -108,6 +108,7 @@ impl<'expansion, 'lowered> Function<'expansion, 'lowered, boltffi_binding::Nativ
             visibility,
             self.expansion,
         )
+        .with_unsafety(source.is_unsafe)
         .render()
     }
 }
@@ -144,6 +145,7 @@ impl<'expansion, 'lowered> Function<'expansion, 'lowered, boltffi_binding::Wasm3
             visibility,
             self.expansion,
         )
+        .with_unsafety(source.is_unsafe)
         .render()
     }
 }

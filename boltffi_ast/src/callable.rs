@@ -171,6 +171,9 @@ pub struct FunctionDef {
     pub form: CallableForm,
     /// Whether the Rust source used `async`.
     pub execution: ExecutionKind,
+    /// Whether callers must uphold the Rust function's safety contract.
+    #[serde(default)]
+    pub is_unsafe: bool,
     /// Parameters written by the Rust function.
     pub parameters: Vec<ParameterDef>,
     /// Return type written by the Rust function.
@@ -202,6 +205,7 @@ impl FunctionDef {
             name: name.into(),
             form: CallableForm::Function,
             execution: ExecutionKind::Sync,
+            is_unsafe: false,
             parameters: Vec::new(),
             returns: ReturnDef::Void,
             doc: None,

@@ -74,7 +74,43 @@ struct BuildContext {
 
 #[derive(Deserialize)]
 struct CargoManifest {
+    package: Option<CargoPackage>,
     lib: Option<LibraryTarget>,
+}
+
+#[derive(Deserialize)]
+struct CargoPackage {
+    metadata: Option<CargoMetadata>,
+}
+
+#[derive(Deserialize)]
+struct CargoMetadata {
+    boltffi: Option<BindingConfig>,
+}
+
+#[derive(Deserialize)]
+struct BindingConfig {
+    #[serde(default)]
+    emit_bindings: bool,
+}
+
+impl CargoManifest {
+    fn load(manifest_dir: &Path) -> Result<Self, BuildError> {
+        let path = manifest_dir.join("Cargo.toml");
+        let source = fs::read_to_string(&path).map_err(|source| BuildError::ReadManifest {
+            path: path.clone(),
+            source,
+        })?;
+        toml::from_str(&source).map_err(|source| BuildError::ParseManifest { path, source })
+    }
+
+    fn emit_bindings(&self) -> bool {
+        self.package
+            .as_ref()
+            .and_then(|package| package.metadata.as_ref())
+            .and_then(|metadata| metadata.boltffi.as_ref())
+            .is_some_and(|config| config.emit_bindings)
+    }
 }
 
 #[derive(Deserialize)]
@@ -194,6 +230,7 @@ impl BuildContext {
                 let _ = ::core::option_env!(#metadata_source);
                 let _ = ::core::option_env!(#metadata_surface);
                 let _ = ::core::option_env!("CARGO_PRIMARY_PACKAGE");
+                let _ = ::core::include_str!(::core::concat!(::core::env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
             };
             #emitted_items
         })
@@ -340,9 +377,12 @@ impl Request {
             Ok("wasm32") => BindingMetadataSurface::Wasm32,
             _ => BindingMetadataSurface::Native,
         };
-        let emission = match env::var_os("CARGO_PRIMARY_PACKAGE") {
-            Some(_) => Emission::Bindings,
-            None => Emission::DataRuntime,
+        let emission = if env::var_os("CARGO_PRIMARY_PACKAGE").is_some()
+            || CargoManifest::load(&manifest_dir)?.emit_bindings()
+        {
+            Emission::Bindings
+        } else {
+            Emission::DataRuntime
         };
         Self::local(manifest_dir, surface, emission)
     }
@@ -352,18 +392,7 @@ impl Request {
         surface: BindingMetadataSurface,
         emission: Emission,
     ) -> Result<Self, BuildError> {
-        let manifest_path = manifest_dir.join("Cargo.toml");
-        let manifest_source =
-            fs::read_to_string(&manifest_path).map_err(|source| BuildError::ReadManifest {
-                path: manifest_path.clone(),
-                source,
-            })?;
-        let manifest = toml::from_str::<CargoManifest>(&manifest_source).map_err(|source| {
-            BuildError::ParseManifest {
-                path: manifest_path,
-                source,
-            }
-        })?;
+        let manifest = CargoManifest::load(&manifest_dir)?;
         let source = manifest.lib.and_then(|library| library.path).map_or_else(
             || manifest_dir.join("src/lib.rs"),
             |path| manifest_dir.join(path),

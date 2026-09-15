@@ -186,11 +186,15 @@ mod tests {
         }
 
         fn check(&self) {
+            self.run_cargo("check");
+        }
+
+        fn run_cargo(&self, command: &str) {
             if cfg!(miri) {
                 return;
             }
             let output = Command::new(cargo())
-                .arg("check")
+                .arg(command)
                 .arg("--quiet")
                 .arg("--manifest-path")
                 .arg(self.root.join("Cargo.toml"))
@@ -475,6 +479,74 @@ mod tests {
         ) -> Result<TokenStream, Error> {
             wrapper::constant::Constant::new(expansion.constant(source)?, expansion).render()
         }
+    }
+
+    #[test]
+    fn unsafe_free_function_wrappers_preserve_safety() {
+        let file: syn::File = syn::parse_quote! {
+            #[export]
+            pub unsafe fn read_address(address: u64) -> u64 { unsafe { *(address as *const u64) } }
+            #[export]
+            pub unsafe fn no_arguments() -> u32 { 7 }
+        };
+        let source = boltffi_scan::scan_file(file, boltffi_ast::PackageInfo::new("demo", None))
+            .expect("unsafe functions scan");
+        let native = lower_with_declarations::<Native>(&source).expect("native lowering");
+        let wasm = lower_with_declarations::<Wasm32>(&source).expect("wasm lowering");
+        for index in 0..2 {
+            let native_tokens = wrapper::function::Function::new(
+                Expansion::new(&native)
+                    .function(&source.functions[index])
+                    .unwrap(),
+                &Expansion::new(&native),
+            )
+            .render()
+            .unwrap()
+            .to_string();
+            let wasm_tokens = wrapper::function::Function::new(
+                Expansion::new(&wasm)
+                    .function(&source.functions[index])
+                    .unwrap(),
+                &Expansion::new(&wasm),
+            )
+            .render()
+            .unwrap()
+            .to_string();
+            for tokens in [native_tokens, wasm_tokens] {
+                assert!(tokens.contains("pub unsafe extern"), "{tokens}");
+                assert!(tokens.contains("unsafe {"), "{tokens}");
+                assert!(
+                    tokens.contains("original Rust function's safety contract"),
+                    "{tokens}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsafe_scalar_exports_round_trip() {
+        let syntax: ItemFn = syn::parse_quote! {
+            pub unsafe fn read_address(address: u64) -> u64 {
+                unsafe { *(address as *const u64) }
+            }
+        };
+        let file = syn::parse_quote! { #[export] #syntax };
+        let source = boltffi_scan::scan_file(file, PackageInfo::new("demo", None)).unwrap();
+        let lowered = lower_with_declarations::<Native>(&source).unwrap();
+        let tokens =
+            expand_function(&Expansion::new(&lowered), &source.functions[0], syntax).unwrap();
+        let generated = GeneratedCrate::create("unsafe_scalar_round_trip");
+        generated.write(quote! {
+            #![deny(unsafe_op_in_unsafe_fn)]
+            #tokens
+            #[test]
+            fn scalar_round_trip() {
+                let value = u64::MAX;
+                let read: unsafe extern "C" fn(u64) -> u64 = boltffi_function_demo_read_address;
+                assert_eq!(unsafe { read((&value as *const u64) as u64) }, value);
+            }
+        });
+        generated.run_cargo("test");
     }
 
     fn expand_function<'lowered, S>(

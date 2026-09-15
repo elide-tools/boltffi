@@ -16,6 +16,7 @@ pub struct Export<'expansion, 'lowered, S: boltffi_binding::SurfaceLower> {
     rust_call: RustCall,
     receiver: ReceiverTokens,
     visibility: TokenStream,
+    is_unsafe: bool,
     expansion: &'expansion Expansion<'lowered, S>,
 }
 
@@ -78,6 +79,7 @@ impl<'expansion, 'lowered> Export<'expansion, 'lowered, boltffi_binding::Native>
             rust_call,
             receiver,
             visibility,
+            is_unsafe: false,
             expansion,
         }
     }
@@ -95,6 +97,11 @@ impl<'expansion, 'lowered> Export<'expansion, 'lowered, boltffi_binding::Native>
         let rust_call = self
             .rust_call
             .expression(wrapper_arguments.rust_arguments());
+        let rust_call = if self.is_unsafe {
+            quote! { unsafe { #rust_call } }
+        } else {
+            rust_call
+        };
         let has_ffi_parameters = !self.receiver.ffi_parameters.is_empty()
             || !wrapper_arguments.ffi_parameters().is_empty();
         let rust_invocation = wrapper::returns::RustInvocation::new(
@@ -135,13 +142,20 @@ impl<'expansion, 'lowered> Export<'expansion, 'lowered, boltffi_binding::Native>
         let return_type = return_tokens.return_type();
         let body = return_tokens.body();
         let visibility = self.visibility;
-        let safety = (!ffi_parameters.is_empty()).then(|| quote! { unsafe });
+        let safety = (self.is_unsafe || !ffi_parameters.is_empty()).then(|| quote! { unsafe });
+        let safety_doc = self.is_unsafe.then(|| {
+            quote! {
+                #[doc = "# Safety"]
+                #[doc = "The caller must uphold the original Rust function's safety contract."]
+            }
+        });
 
         Ok(quote! {
             #(#argument_items)*
             #(#return_items)*
             #cfg
             #[unsafe(no_mangle)]
+            #safety_doc
             #visibility #safety extern "C" fn #export_ident(#(#ffi_parameters),*) #return_type {
                 // Tracks isolate-blocked sync entries so foreign-thread Dart
                 // callback waits can fail fast instead of deadlocking. No-op
@@ -189,6 +203,7 @@ impl<'expansion, 'lowered> Export<'expansion, 'lowered, boltffi_binding::Wasm32>
             rust_call,
             receiver,
             visibility,
+            is_unsafe: false,
             expansion,
         }
     }
@@ -206,6 +221,11 @@ impl<'expansion, 'lowered> Export<'expansion, 'lowered, boltffi_binding::Wasm32>
         let rust_call = self
             .rust_call
             .expression(wrapper_arguments.rust_arguments());
+        let rust_call = if self.is_unsafe {
+            quote! { unsafe { #rust_call } }
+        } else {
+            rust_call
+        };
         let has_ffi_parameters = !self.receiver.ffi_parameters.is_empty()
             || !wrapper_arguments.ffi_parameters().is_empty();
         let rust_invocation = wrapper::returns::RustInvocation::new(
@@ -246,13 +266,20 @@ impl<'expansion, 'lowered> Export<'expansion, 'lowered, boltffi_binding::Wasm32>
         let return_type = return_tokens.return_type();
         let body = return_tokens.body();
         let visibility = self.visibility;
-        let safety = (!ffi_parameters.is_empty()).then(|| quote! { unsafe });
+        let safety = (self.is_unsafe || !ffi_parameters.is_empty()).then(|| quote! { unsafe });
+        let safety_doc = self.is_unsafe.then(|| {
+            quote! {
+                #[doc = "# Safety"]
+                #[doc = "The caller must uphold the original Rust function's safety contract."]
+            }
+        });
 
         Ok(quote! {
             #(#argument_items)*
             #(#return_items)*
             #cfg
             #[unsafe(no_mangle)]
+            #safety_doc
             #visibility #safety extern "C" fn #export_ident(#(#ffi_parameters),*) #return_type {
                 #body
             }
@@ -276,6 +303,13 @@ impl<'expansion, 'lowered> Export<'expansion, 'lowered, boltffi_binding::Wasm32>
             .render(),
             false => Ok(TokenStream::new()),
         }
+    }
+}
+
+impl<S: boltffi_binding::SurfaceLower> Export<'_, '_, S> {
+    pub fn with_unsafety(mut self, is_unsafe: bool) -> Self {
+        self.is_unsafe = is_unsafe;
+        self
     }
 }
 

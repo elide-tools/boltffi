@@ -50,6 +50,7 @@ pub struct NativeImageContract {
     direct_records: Vec<String>,
     free_buffer: String,
     buffer_from_bytes: String,
+    checks_error_buffer: bool,
     callbacks: Vec<CallbackUpcall>,
     closures: Vec<ClosureUpcall>,
     completions: Vec<CompletionUpcall>,
@@ -288,12 +289,27 @@ impl NativeImageContract {
             direct_records,
             free_buffer,
             buffer_from_bytes,
+            checks_error_buffer: jvm
+                .methods()
+                .iter()
+                .chain(jvm.streams().iter().flat_map(|stream| stream.methods()))
+                .any(|method| method.checks_error_buffer())
+                || jvm
+                    .callbacks()
+                    .iter()
+                    .flat_map(|callback| callback.handle_methods())
+                    .any(|method| method.checks_error_buffer()),
             callbacks,
             closures,
             completions,
             continuation: continuation.map(|(trampoline, _)| trampoline),
             glue_header_file,
         })
+    }
+
+    /// Whether any downcall needs the host's encoded-error exception helper.
+    pub fn checks_error_buffer(&self) -> bool {
+        self.checks_error_buffer
     }
 
     /// Returns the `Lib` symbol that copies bytes into an owned buffer through a pointer.

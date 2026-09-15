@@ -14,12 +14,13 @@ pub struct ManagedPath(String);
 #[derive(Clone, Copy)]
 pub enum SourceKind {
     Java,
-    Jni,
+    Native,
 }
 
 pub struct ManagedRoots {
     package: ManagedPath,
     jni: ManagedPath,
+    native_image: ManagedPath,
 }
 
 impl ManagedPath {
@@ -106,7 +107,7 @@ impl ManagedPath {
             .and_then(|extension| extension.to_str())
         {
             Some("java") => true,
-            Some("c" | "h") => self.0.starts_with("jni/"),
+            Some("c" | "h") => self.0.starts_with("jni/") || self.0.starts_with("native_image/"),
             _ => false,
         }
     }
@@ -158,7 +159,7 @@ impl SourceKind {
                     .extension()
                     .and_then(|extension| extension.to_str()),
             ),
-            (Self::Java, Some("java")) | (Self::Jni, Some("c" | "h"))
+            (Self::Java, Some("java")) | (Self::Native, Some("c" | "h"))
         )
     }
 }
@@ -168,19 +169,22 @@ impl ManagedRoots {
         Ok(Self {
             package: ManagedPath::from_path(Path::new(&package.replace('.', "/")))?,
             jni: ManagedPath::literal("jni"),
+            native_image: ManagedPath::literal("native_image"),
         })
     }
 
     pub fn accepts_output(&self, path: &ManagedPath) -> bool {
         (path.belongs_to(&self.package) && SourceKind::Java.accepts(path))
-            || (path.belongs_to(&self.jni) && SourceKind::Jni.accepts(path))
+            || (path.belongs_to(&self.jni) && SourceKind::Native.accepts(path))
+            || (path.belongs_to(&self.native_image) && SourceKind::Native.accepts(path))
     }
 
     pub fn sources(&self, directory: &Directory) -> Result<BTreeSet<ManagedPath>> {
         let mut sources = BTreeSet::new();
         [
             (&self.package, SourceKind::Java),
-            (&self.jni, SourceKind::Jni),
+            (&self.jni, SourceKind::Native),
+            (&self.native_image, SourceKind::Native),
         ]
         .into_iter()
         .try_for_each(|(path, kind)| directory.collect_sources(path, kind, &mut sources))?;
@@ -188,6 +192,6 @@ impl ManagedRoots {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &ManagedPath> {
-        [&self.package, &self.jni].into_iter()
+        [&self.package, &self.jni, &self.native_image].into_iter()
     }
 }

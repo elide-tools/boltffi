@@ -1,4 +1,6 @@
-use boltffi_ast::{FunctionDef, FunctionId, ParameterDef};
+use boltffi_ast::{
+    ExecutionKind, FunctionDef, FunctionId, ParameterDef, ParameterPassing, ReturnDef, TypeExpr,
+};
 use syn::spanned::Spanned;
 
 use crate::attributes::Attributes;
@@ -22,7 +24,9 @@ fn build(
     declared_types: &DeclaredTypes,
 ) -> Result<FunctionDef, ScanError> {
     let ident = &item.sig.ident;
-    signature::validate(&item.sig, format!("function {ident}"))?;
+    let item_name = format!("function {ident}");
+    crate::unsupported::generics(&item.sig.generics, &item_name)?;
+    crate::unsupported::extern_abi(item.sig.abi.as_ref(), &item_name)?;
     let mut function = FunctionDef::new(
         FunctionId::new(scope.path().qualified(&ident.to_string())),
         name::source(ident),
@@ -32,8 +36,22 @@ fn build(
     function.source = attributes::source(&item.vis, scope, item.span());
     function.source_span = function.source.span.clone();
     function.execution = signature::execution(&item.sig);
+    function.is_unsafe = item.sig.unsafety.is_some();
     function.parameters = parameters(&item.sig, &scanner)?;
     function.returns = scanner.scan_export_return(&item.sig.output)?;
+    if function.is_unsafe
+        && (function.execution != ExecutionKind::Sync
+            || function.parameters.iter().any(|parameter| {
+                parameter.passing != ParameterPassing::Value
+                    || !matches!(parameter.type_expr, TypeExpr::Primitive(_))
+            })
+            || !matches!(
+                function.returns,
+                ReturnDef::Void | ReturnDef::Value(TypeExpr::Primitive(_))
+            ))
+    {
+        return Err(ScanError::UnsupportedUnsafe { item: item_name });
+    }
     function.doc = attrs.doc();
     function.deprecated = attrs.deprecated()?;
     function.user_attrs = attrs.user_attrs();
@@ -301,15 +319,29 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsafe_function_before_erasing_unsafety() {
-        let error = scan("pub unsafe fn free_handle(handle: i32) {}").expect_err("unsafe rejected");
+    fn scans_unsafe_primitive_free_function() {
+        let function = scan("pub unsafe fn read_value(address: u64, len: u32) -> u32 { 0 }")
+            .expect("unsafe primitive function");
+        assert!(function.is_unsafe);
+        assert!(!scan("pub fn safe() {}").unwrap().is_unsafe);
+        assert!(scan("pub unsafe fn no_arguments() {}").unwrap().is_unsafe);
+    }
 
-        assert_eq!(
-            error,
-            ScanError::UnsupportedUnsafe {
-                item: "function free_handle".to_owned()
-            }
-        );
+    #[test]
+    fn rejects_unsafe_nonprimitive_and_async_functions() {
+        for source in [
+            "pub async unsafe fn unsupported(value: u64) -> u64 { value }",
+            "pub unsafe fn unsupported(value: &u64) -> u64 { *value }",
+            "pub unsafe fn unsupported(value: String) {}",
+            "pub unsafe fn unsupported() -> String { String::new() }",
+        ] {
+            assert_eq!(
+                scan(source),
+                Err(ScanError::UnsupportedUnsafe {
+                    item: "function unsupported".to_owned()
+                })
+            );
+        }
     }
 
     #[test]

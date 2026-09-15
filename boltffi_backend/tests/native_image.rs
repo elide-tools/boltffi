@@ -71,6 +71,32 @@ fn renders_scalar_functions_without_transition() {
 }
 
 #[test]
+fn renders_unsafe_scalar_functions_without_transition() {
+    let out = rendered(
+        r#"
+        #[export]
+        pub unsafe fn record_counter(handle: u64, value: u64, address: u64, len: u32) -> u32 { 0 }
+    "#,
+    );
+    assert!(out.contains("@CFunction(transition = CFunction.Transition.NO_TRANSITION)\n        static native int boltffi_function_demo_record_counter(long handle, long value, long address, int len);"));
+    assert!(
+        out.contains(
+            "return Lib.boltffi_function_demo_record_counter(handle, value, address, len);"
+        )
+    );
+}
+
+#[test]
+fn emits_error_buffer_support_only_when_needed() {
+    let scalar = rendered(PRIMITIVE_FUNCTIONS);
+    assert!(!scalar.contains("BoltFfiErrorBufferException"));
+    assert!(!scalar.contains("static void checkErrorBuffer"));
+    let fallible = rendered(ERRORS);
+    assert!(fallible.contains("static void checkErrorBuffer"));
+    assert!(fallible.contains("throw new BoltFfiErrorBufferException"));
+}
+
+#[test]
 fn contract_advertises_native_image_capability_and_owner() {
     use boltffi_backend::{
         bridge::jni::BridgeOwner,
