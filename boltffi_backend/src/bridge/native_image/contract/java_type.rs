@@ -116,6 +116,26 @@ impl JavaCType {
     pub const fn is_void(self) -> bool {
         matches!(self, Self::Void)
     }
+
+    /// Returns the `@CEntryPointOptions` bailout class for a custom prologue.
+    ///
+    /// Native Image only derives a bailout value automatically for `void` and
+    /// `int` entry points; every other return type must name a class whose
+    /// `bailout(int)` supplies the value returned when the prologue fails.
+    pub const fn prologue_bailout(self) -> Option<&'static str> {
+        match self {
+            Self::Void | Self::Int => None,
+            Self::Boolean => Some("BailoutBoolean"),
+            Self::Byte => Some("BailoutByte"),
+            Self::Short => Some("BailoutShort"),
+            Self::Long => Some("BailoutLong"),
+            Self::Float => Some("BailoutFloat"),
+            Self::Double => Some("BailoutDouble"),
+            Self::Pointer => {
+                Some("com.oracle.svm.guest.staging.c.function.CEntryPointOptions.ReturnNullPointer")
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for JavaCType {

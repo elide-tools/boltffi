@@ -62,6 +62,11 @@ impl Trampoline {
         self.java_returns
     }
 
+    /// Returns the `@CEntryPointOptions` bailout class the return type needs.
+    pub const fn prologue_bailout(&self) -> Option<&'static str> {
+        self.java_returns.prologue_bailout()
+    }
+
     /// Returns the Java statements.
     pub fn body(&self) -> &[String] {
         &self.body
