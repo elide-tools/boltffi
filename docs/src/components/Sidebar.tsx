@@ -159,22 +159,23 @@ const sections: Section[] = [
       { id: "containers", label: "Containers" },
     ]
   },
-  { 
-    id: "packaging", 
-    label: "Packaging", 
+  {
+    id: "packaging",
+    label: "Packaging",
     icon: Box,
     children: [
       { id: "apple-packaging", label: "Apple" },
       { id: "android-packaging", label: "Android" },
       { id: "java-packaging", label: "Java" },
+      { id: "native-image-backend", label: "Native Image Backend" },
       { id: "c-sharp-generation", label: "C#" },
       { id: "wasm-packaging", label: "WASM" },
       { id: "python-packaging", label: "Python" },
     ]
   },
-  { 
-    id: "configuration", 
-    label: "Configuration", 
+  {
+    id: "configuration",
+    label: "Configuration",
     icon: Settings,
     children: [
       { id: "package-identity", label: "Package Identity" },
@@ -182,6 +183,7 @@ const sections: Section[] = [
       { id: "swiftpm-layouts", label: "SwiftPM Layouts" },
       { id: "android-configuration", label: "Android" },
       { id: "java-configuration", label: "Java" },
+      { id: "native-image-backend", label: "Native Image Backend" },
       { id: "c-sharp-configuration", label: "C#" },
       { id: "wasm-configuration", label: "WASM" },
       { id: "python-configuration", label: "Python" },
