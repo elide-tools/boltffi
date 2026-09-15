@@ -92,3 +92,153 @@ fn contract_advertises_native_image_capability_and_owner() {
             .is_stable()
     );
 }
+
+const DIRECT_RECORD: &str = r#"
+    #[repr(C)]
+    #[data]
+    pub struct Point {
+        pub x: f64,
+        pub y: f64,
+    }
+
+    #[export]
+    pub fn echo_point(point: Point) -> Point { point }
+
+    #[export]
+    pub fn nudge(point: &mut Point, by: f64) { point.x += by; }
+"#;
+
+const ENCODED_BYTES: &str = r#"
+    #[data]
+    pub struct Named {
+        pub name: String,
+        pub tags: Vec<String>,
+    }
+
+    #[export]
+    pub fn greet(name: String) -> String { format!("hi {name}") }
+
+    #[export]
+    pub fn describe(value: Named) -> Named { value }
+
+    #[data(impl)]
+    impl Named {
+        pub fn rename(&mut self, name: String) { self.name = name; }
+    }
+"#;
+
+const ERRORS: &str = r#"
+    #[error]
+    pub struct AppError {
+        pub code: i32,
+        pub message: String,
+    }
+
+    #[error]
+    pub enum ParseError {
+        Missing,
+        Invalid,
+    }
+
+    #[export]
+    pub fn may_fail(valid: bool) -> Result<String, AppError> {
+        match valid {
+            true => Ok("ok".to_owned()),
+            false => Err(AppError { code: 400, message: "invalid".to_owned() }),
+        }
+    }
+
+    #[export]
+    pub fn parse(valid: bool) -> Result<i32, ParseError> {
+        if valid { Ok(1) } else { Err(ParseError::Invalid) }
+    }
+
+    #[export]
+    pub fn check(valid: bool) -> Result<(), ParseError> {
+        if valid { Ok(()) } else { Err(ParseError::Missing) }
+    }
+"#;
+
+const DIRECT_VECTORS: &str = r#"
+    #[export]
+    pub fn sum(values: &[i32]) -> i64 { values.iter().map(|v| *v as i64).sum() }
+
+    #[export]
+    pub fn increment(values: &mut [u64]) {
+        values.iter_mut().for_each(|value| *value += 1);
+    }
+"#;
+
+#[test]
+fn renders_direct_record_downcalls_through_the_shim() {
+    let out = rendered(DIRECT_RECORD);
+    // by-value record in and out goes through a pointer shim
+    assert!(out.contains("static native void boltffi_ni_boltffi_function_demo_echo_point(org.graalvm.word.PointerBase point, org.graalvm.word.PointerBase __out);"));
+    assert!(
+        out.contains("static byte[] boltffi_function_demo_echo_point(java.nio.ByteBuffer point) {")
+    );
+    assert!(out.contains("directAddress(point, SizeOf.get(___PointStruct.class))"));
+    assert!(out.contains("byte[] __result_record = new byte[SizeOf.get(___PointStruct.class)];"));
+    assert!(
+        out.contains("@CStruct(\"___Point\")\n    interface ___PointStruct extends PointerBase {}")
+    );
+    // the C shim writes the by-value return through the out pointer
+    assert!(out.contains("void boltffi_ni_boltffi_function_demo_echo_point(const ___Point *point, ___Point *__out) {\n    *__out = boltffi_function_demo_echo_point(*point);\n}"));
+    // `&mut Point` is a pointer receive with a status return
+    assert!(out.contains(
+        "checkStatus(Lib.boltffi_ni_boltffi_function_demo_nudge(__boltffi_point_ptr, by));"
+    ));
+    insta::assert_snapshot!(out);
+}
+
+#[test]
+fn renders_encoded_bytes_and_owned_buffer_returns() {
+    let out = rendered(ENCODED_BYTES);
+    assert!(out.contains("static byte[] boltffi_function_demo_greet(java.nio.ByteBuffer name, int __boltffi_name_len) {"));
+    assert!(out.contains("directAddress(name, __boltffi_name_len)"));
+    assert!(out.contains("FfiBuf __result_buffer = StackValue.get(FfiBuf.class);"));
+    assert!(out.contains("return takeBuffer(__result_buffer);"));
+    assert!(out.contains(
+        "static native void boltffi_ni_boltffi_free_buf(org.graalvm.word.PointerBase buf);"
+    ));
+    assert!(out.contains(
+        "void boltffi_ni_boltffi_free_buf(const FfiBuf_u8 *buf) {\n    boltffi_free_buf(*buf);\n}"
+    ));
+    insta::assert_snapshot!(out);
+}
+
+#[test]
+fn renders_status_and_encoded_error_returns() {
+    let out = rendered(ERRORS);
+    assert!(out.contains("checkErrorBuffer(__error);"));
+    assert!(out.contains("static native void boltffi_ni_boltffi_function_demo_parse(boolean valid, org.graalvm.word.PointerBase return_out, org.graalvm.word.PointerBase __out);"));
+    assert!(out.contains("StackValue.get(org.graalvm.nativeimage.c.type.CIntPointer.class);"));
+    assert!(out.contains("static void boltffi_function_demo_check(boolean valid) {"));
+    assert!(out.contains("static int boltffi_function_demo_parse(boolean valid) {"));
+    assert!(out.contains("static byte[] boltffi_function_demo_may_fail(boolean valid) {"));
+    insta::assert_snapshot!(out);
+}
+
+#[test]
+fn renders_direct_vectors_through_pinned_arrays() {
+    let out = rendered(DIRECT_VECTORS);
+    assert!(out.contains("static long boltffi_function_demo_sum(int[] values) {"));
+    assert!(out.contains("try (PinnedObject __pin_values = PinnedObject.create(values)) {"));
+    assert!(out.contains("__pin_values.addressOfArrayElement(0), (long) values.length"));
+    assert!(out.contains("static void boltffi_function_demo_increment(long[] values) {"));
+    insta::assert_snapshot!(out);
+}
+
+/// Debug helper: `BOLTFFI_NI_FIXTURE=errors cargo test --test native_image dump_fixture -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn dump_fixture() {
+    let source = match std::env::var("BOLTFFI_NI_FIXTURE").as_deref() {
+        Ok("record") => DIRECT_RECORD,
+        Ok("bytes") => ENCODED_BYTES,
+        Ok("errors") => ERRORS,
+        Ok("vectors") => DIRECT_VECTORS,
+        _ => PRIMITIVE_FUNCTIONS,
+    };
+    eprintln!("{}", rendered(source));
+}

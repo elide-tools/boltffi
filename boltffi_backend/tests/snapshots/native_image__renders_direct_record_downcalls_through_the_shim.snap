@@ -1,0 +1,161 @@
+---
+source: boltffi_backend/tests/native_image.rs
+expression: out
+---
+===== com/boltffi/demo/BoltFFINativeImage.java =====
+package com.boltffi.demo;
+
+import java.util.Collections;
+import java.util.List;
+import org.graalvm.nativeimage.CurrentIsolate;
+import org.graalvm.nativeimage.Isolate;
+import org.graalvm.nativeimage.PinnedObject;
+import org.graalvm.nativeimage.StackValue;
+import org.graalvm.nativeimage.UnmanagedMemory;
+import org.graalvm.nativeimage.c.CContext;
+import org.graalvm.nativeimage.c.function.CEntryPoint;
+import org.graalvm.nativeimage.c.function.CEntryPointLiteral;
+import org.graalvm.nativeimage.c.function.CFunction;
+import org.graalvm.nativeimage.c.function.CFunctionPointer;
+import org.graalvm.nativeimage.c.function.CLibrary;
+import org.graalvm.nativeimage.c.struct.CField;
+import org.graalvm.nativeimage.c.struct.CStruct;
+import org.graalvm.nativeimage.c.struct.SizeOf;
+import org.graalvm.nativeimage.c.type.CCharPointer;
+import org.graalvm.nativeimage.c.type.CTypeConversion;
+import org.graalvm.word.PointerBase;
+import org.graalvm.word.WordFactory;
+
+@CContext(BoltFFINativeImage.Directives.class)
+@CLibrary(value = "demo_core", requireStatic = true)
+final class BoltFFINativeImage {
+    private BoltFFINativeImage() {}
+
+    /** Build-time directives: the generated C header and its include directory. */
+    static final class Directives implements CContext.Directives {
+        @Override
+        public List<String> getHeaderFiles() {
+            return Collections.singletonList("<demo.h>");
+        }
+
+        @Override
+        public List<String> getOptions() {
+            return Collections.singletonList("-I" + System.getProperty("boltffi.include", "."));
+        }
+    }
+
+    /** Owned BoltFFI byte buffer (`FfiBuf_u8`) viewed through a pointer. */
+    @CStruct("FfiBuf_u8")
+    interface FfiBuf extends PointerBase {
+        @CField("ptr") CCharPointer ptr();
+        @CField("ptr") void ptr(CCharPointer value);
+        @CField("len") long len();
+        @CField("len") void len(long value);
+        @CField("cap") void cap(long value);
+        @CField("align") void align(long value);
+    }
+
+    /** Size probe for the direct record `___Point`. */
+    @CStruct("___Point")
+    interface ___PointStruct extends PointerBase {}
+
+    static void zeroBuffer(FfiBuf buffer) {
+        buffer.ptr(WordFactory.nullPointer());
+        buffer.len(0L);
+        buffer.cap(0L);
+        buffer.align(0L);
+    }
+
+    /** Returns the base address of a direct buffer with at least `required` capacity. */
+    static long directAddress(java.nio.ByteBuffer buffer, long required) {
+        if (buffer == null) {
+            throw new IllegalArgumentException("BoltFFI direct buffer argument was null");
+        }
+        if (required < 0) {
+            throw new IllegalArgumentException("BoltFFI direct buffer length was negative");
+        }
+        if (!buffer.isDirect()) {
+            throw new IllegalArgumentException("BoltFFI argument was not a direct buffer");
+        }
+        if (buffer.capacity() < required) {
+            throw new IllegalArgumentException("BoltFFI direct buffer capacity was too small");
+        }
+        return java.lang.foreign.MemorySegment.ofBuffer(buffer.duplicate().clear()).address();
+    }
+
+    /** Copies an owned Rust buffer into a Java array and releases it. */
+    static byte[] takeBuffer(FfiBuf buffer) {
+        long length = buffer.len();
+        if (buffer.ptr().isNull()) {
+            if (length != 0) {
+                throw new RuntimeException("BoltFFI buffer pointer was null with non-zero length");
+            }
+            return new byte[0];
+        }
+        if (length > Integer.MAX_VALUE) {
+            Lib.boltffi_ni_boltffi_free_buf(buffer);
+            throw new RuntimeException("BoltFFI buffer too large for Java byte array");
+        }
+        byte[] bytes = new byte[(int) length];
+        CTypeConversion.asByteBuffer(buffer.ptr(), (int) length).get(bytes);
+        Lib.boltffi_ni_boltffi_free_buf(buffer);
+        return bytes;
+    }
+
+    static void checkStatus(int code) {
+        if (code != 0) {
+            throw new RuntimeException("BoltFFI call failed");
+        }
+    }
+
+    static void checkErrorBuffer(FfiBuf error) {
+        if (error.ptr().isNonNull() || error.len() != 0) {
+            throw new BoltFfiErrorBufferException(takeBuffer(error));
+        }
+    }
+
+    /** Direct declarations of the C ABI (or its pointer-ABI shims). */
+    static final class Lib {
+        private Lib() {}
+
+        @CFunction(transition = CFunction.Transition.NO_TRANSITION)
+        static native void boltffi_ni_boltffi_free_buf(org.graalvm.word.PointerBase buf);
+
+        @CFunction(transition = CFunction.Transition.NO_TRANSITION)
+        static native void boltffi_ni_boltffi_function_demo_echo_point(org.graalvm.word.PointerBase point, org.graalvm.word.PointerBase __out);
+
+        @CFunction(transition = CFunction.Transition.NO_TRANSITION)
+        static native int boltffi_ni_boltffi_function_demo_nudge(org.graalvm.word.PointerBase point, double by);
+    }
+
+    static byte[] boltffi_function_demo_echo_point(java.nio.ByteBuffer point) {
+        PointerBase __boltffi_point_ptr = WordFactory.pointer(directAddress(point, SizeOf.get(___PointStruct.class)));
+        byte[] __result_record = new byte[SizeOf.get(___PointStruct.class)];
+        try (PinnedObject __pin_result = PinnedObject.create(__result_record)) {
+            Lib.boltffi_ni_boltffi_function_demo_echo_point(__boltffi_point_ptr, __pin_result.addressOfArrayElement(0));
+        }
+        return __result_record;
+    }
+
+    static void boltffi_function_demo_nudge(java.nio.ByteBuffer point, double by) {
+        PointerBase __boltffi_point_ptr = WordFactory.pointer(directAddress(point, SizeOf.get(___PointStruct.class)));
+        checkStatus(Lib.boltffi_ni_boltffi_function_demo_nudge(__boltffi_point_ptr, by));
+    }
+}
+===== native_image/native_image_glue.c =====
+// Generated by BoltFFI. Pointer-ABI shims for GraalVM Native Image @CFunction calls.
+#include <stdint.h>
+#include <string.h>
+#include "demo.h"
+
+void boltffi_ni_boltffi_free_buf(const FfiBuf_u8 *buf) {
+    boltffi_free_buf(*buf);
+}
+
+void boltffi_ni_boltffi_function_demo_echo_point(const ___Point *point, ___Point *__out) {
+    *__out = boltffi_function_demo_echo_point(*point);
+}
+
+int32_t boltffi_ni_boltffi_function_demo_nudge(___Point *point, double by) {
+    return boltffi_function_demo_nudge(point, by).code;
+}

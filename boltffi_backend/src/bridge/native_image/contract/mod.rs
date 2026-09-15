@@ -17,7 +17,7 @@ use crate::{
     core::{FilePath, Result},
 };
 
-pub use downcall::{Downcall, LibParameter, Transition, WrapperBody, WrapperParameter};
+pub use downcall::{Downcall, LibParameter, Transition, Wrapper, WrapperParameter};
 pub use java_type::JavaCType;
 pub use shim::ShimFunction;
 
@@ -34,6 +34,8 @@ pub struct NativeImageContract {
     glue_header: HeaderInclude,
     downcalls: Vec<Downcall>,
     shims: Vec<ShimFunction>,
+    direct_records: Vec<String>,
+    free_buffer: String,
 }
 
 impl NativeImageContract {
@@ -52,11 +54,26 @@ impl NativeImageContract {
                 invariant: "Native Image contract names the bridge-rendered class",
             })?;
         let transition = policy.resolve(c_bridge);
-        let downcalls = jvm
-            .methods()
-            .iter()
-            .map(|method| Downcall::from_native_method(method, transition))
+        let free_buffer_function = c_bridge.support().buffer_free()?;
+        let support = [free_buffer_function]
+            .into_iter()
+            .map(|function| Downcall::from_c_function(function, Transition::NoTransition));
+        let downcalls = support
+            .chain(
+                jvm.methods()
+                    .iter()
+                    .map(|method| Downcall::from_native_method(method, transition)),
+            )
             .collect::<Result<Vec<_>>>()?;
+        let free_buffer = downcalls
+            .first()
+            .map(|downcall| downcall.lib_name().as_str().to_owned())
+            .unwrap_or_default();
+        let direct_records = c_bridge
+            .direct_records()
+            .iter()
+            .map(|record| record.name().to_owned())
+            .collect();
         let shims = downcalls
             .iter()
             .map(ShimFunction::for_downcall)
@@ -88,7 +105,19 @@ impl NativeImageContract {
             glue_header: HeaderInclude::from_files(glue_path, c_bridge.header_path())?,
             downcalls,
             shims,
+            direct_records,
+            free_buffer,
         })
+    }
+
+    /// Returns C typedef names of direct records, each needing a `@CStruct` size probe.
+    pub fn direct_records(&self) -> &[String] {
+        &self.direct_records
+    }
+
+    /// Returns the `Lib` symbol that releases an owned buffer through a pointer.
+    pub fn free_buffer(&self) -> &str {
+        &self.free_buffer
     }
 
     /// Returns the Java package of the generated class.

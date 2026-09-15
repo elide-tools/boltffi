@@ -1,0 +1,175 @@
+---
+source: boltffi_backend/tests/native_image.rs
+expression: out
+---
+===== com/boltffi/demo/BoltFFINativeImage.java =====
+package com.boltffi.demo;
+
+import java.util.Collections;
+import java.util.List;
+import org.graalvm.nativeimage.CurrentIsolate;
+import org.graalvm.nativeimage.Isolate;
+import org.graalvm.nativeimage.PinnedObject;
+import org.graalvm.nativeimage.StackValue;
+import org.graalvm.nativeimage.UnmanagedMemory;
+import org.graalvm.nativeimage.c.CContext;
+import org.graalvm.nativeimage.c.function.CEntryPoint;
+import org.graalvm.nativeimage.c.function.CEntryPointLiteral;
+import org.graalvm.nativeimage.c.function.CFunction;
+import org.graalvm.nativeimage.c.function.CFunctionPointer;
+import org.graalvm.nativeimage.c.function.CLibrary;
+import org.graalvm.nativeimage.c.struct.CField;
+import org.graalvm.nativeimage.c.struct.CStruct;
+import org.graalvm.nativeimage.c.struct.SizeOf;
+import org.graalvm.nativeimage.c.type.CCharPointer;
+import org.graalvm.nativeimage.c.type.CTypeConversion;
+import org.graalvm.word.PointerBase;
+import org.graalvm.word.WordFactory;
+
+@CContext(BoltFFINativeImage.Directives.class)
+@CLibrary(value = "demo_core", requireStatic = true)
+final class BoltFFINativeImage {
+    private BoltFFINativeImage() {}
+
+    /** Build-time directives: the generated C header and its include directory. */
+    static final class Directives implements CContext.Directives {
+        @Override
+        public List<String> getHeaderFiles() {
+            return Collections.singletonList("<demo.h>");
+        }
+
+        @Override
+        public List<String> getOptions() {
+            return Collections.singletonList("-I" + System.getProperty("boltffi.include", "."));
+        }
+    }
+
+    /** Owned BoltFFI byte buffer (`FfiBuf_u8`) viewed through a pointer. */
+    @CStruct("FfiBuf_u8")
+    interface FfiBuf extends PointerBase {
+        @CField("ptr") CCharPointer ptr();
+        @CField("ptr") void ptr(CCharPointer value);
+        @CField("len") long len();
+        @CField("len") void len(long value);
+        @CField("cap") void cap(long value);
+        @CField("align") void align(long value);
+    }
+
+    static void zeroBuffer(FfiBuf buffer) {
+        buffer.ptr(WordFactory.nullPointer());
+        buffer.len(0L);
+        buffer.cap(0L);
+        buffer.align(0L);
+    }
+
+    /** Returns the base address of a direct buffer with at least `required` capacity. */
+    static long directAddress(java.nio.ByteBuffer buffer, long required) {
+        if (buffer == null) {
+            throw new IllegalArgumentException("BoltFFI direct buffer argument was null");
+        }
+        if (required < 0) {
+            throw new IllegalArgumentException("BoltFFI direct buffer length was negative");
+        }
+        if (!buffer.isDirect()) {
+            throw new IllegalArgumentException("BoltFFI argument was not a direct buffer");
+        }
+        if (buffer.capacity() < required) {
+            throw new IllegalArgumentException("BoltFFI direct buffer capacity was too small");
+        }
+        return java.lang.foreign.MemorySegment.ofBuffer(buffer.duplicate().clear()).address();
+    }
+
+    /** Copies an owned Rust buffer into a Java array and releases it. */
+    static byte[] takeBuffer(FfiBuf buffer) {
+        long length = buffer.len();
+        if (buffer.ptr().isNull()) {
+            if (length != 0) {
+                throw new RuntimeException("BoltFFI buffer pointer was null with non-zero length");
+            }
+            return new byte[0];
+        }
+        if (length > Integer.MAX_VALUE) {
+            Lib.boltffi_ni_boltffi_free_buf(buffer);
+            throw new RuntimeException("BoltFFI buffer too large for Java byte array");
+        }
+        byte[] bytes = new byte[(int) length];
+        CTypeConversion.asByteBuffer(buffer.ptr(), (int) length).get(bytes);
+        Lib.boltffi_ni_boltffi_free_buf(buffer);
+        return bytes;
+    }
+
+    static void checkStatus(int code) {
+        if (code != 0) {
+            throw new RuntimeException("BoltFFI call failed");
+        }
+    }
+
+    static void checkErrorBuffer(FfiBuf error) {
+        if (error.ptr().isNonNull() || error.len() != 0) {
+            throw new BoltFfiErrorBufferException(takeBuffer(error));
+        }
+    }
+
+    /** Direct declarations of the C ABI (or its pointer-ABI shims). */
+    static final class Lib {
+        private Lib() {}
+
+        @CFunction(transition = CFunction.Transition.NO_TRANSITION)
+        static native void boltffi_ni_boltffi_free_buf(org.graalvm.word.PointerBase buf);
+
+        @CFunction(transition = CFunction.Transition.NO_TRANSITION)
+        static native int boltffi_ni_boltffi_method_record_demo_named_rename(org.graalvm.word.PointerBase receiver_ptr, long receiver_len, org.graalvm.word.PointerBase receiver_out, org.graalvm.word.PointerBase name_ptr, long name_len);
+
+        @CFunction(transition = CFunction.Transition.NO_TRANSITION)
+        static native void boltffi_ni_boltffi_function_demo_greet(org.graalvm.word.PointerBase name_ptr, long name_len, org.graalvm.word.PointerBase __out);
+
+        @CFunction(transition = CFunction.Transition.NO_TRANSITION)
+        static native void boltffi_ni_boltffi_function_demo_describe(org.graalvm.word.PointerBase value_ptr, long value_len, org.graalvm.word.PointerBase __out);
+    }
+
+    static byte[] boltffi_method_record_demo_named_rename(java.nio.ByteBuffer receiver, int __boltffi_receiver_len, java.nio.ByteBuffer name, int __boltffi_name_len) {
+        PointerBase __boltffi_receiver_ptr = WordFactory.pointer(directAddress(receiver, __boltffi_receiver_len));
+        FfiBuf __boltffi_receiver_out = StackValue.get(FfiBuf.class);
+        zeroBuffer(__boltffi_receiver_out);
+        PointerBase __boltffi_name_ptr = WordFactory.pointer(directAddress(name, __boltffi_name_len));
+        checkStatus(Lib.boltffi_ni_boltffi_method_record_demo_named_rename(__boltffi_receiver_ptr, (long) __boltffi_receiver_len, __boltffi_receiver_out, __boltffi_name_ptr, (long) __boltffi_name_len));
+        return takeBuffer(__boltffi_receiver_out);
+    }
+
+    static byte[] boltffi_function_demo_greet(java.nio.ByteBuffer name, int __boltffi_name_len) {
+        PointerBase __boltffi_name_ptr = WordFactory.pointer(directAddress(name, __boltffi_name_len));
+        FfiBuf __result_buffer = StackValue.get(FfiBuf.class);
+        zeroBuffer(__result_buffer);
+        Lib.boltffi_ni_boltffi_function_demo_greet(__boltffi_name_ptr, (long) __boltffi_name_len, __result_buffer);
+        return takeBuffer(__result_buffer);
+    }
+
+    static byte[] boltffi_function_demo_describe(java.nio.ByteBuffer value, int __boltffi_value_len) {
+        PointerBase __boltffi_value_ptr = WordFactory.pointer(directAddress(value, __boltffi_value_len));
+        FfiBuf __result_buffer = StackValue.get(FfiBuf.class);
+        zeroBuffer(__result_buffer);
+        Lib.boltffi_ni_boltffi_function_demo_describe(__boltffi_value_ptr, (long) __boltffi_value_len, __result_buffer);
+        return takeBuffer(__result_buffer);
+    }
+}
+===== native_image/native_image_glue.c =====
+// Generated by BoltFFI. Pointer-ABI shims for GraalVM Native Image @CFunction calls.
+#include <stdint.h>
+#include <string.h>
+#include "demo.h"
+
+void boltffi_ni_boltffi_free_buf(const FfiBuf_u8 *buf) {
+    boltffi_free_buf(*buf);
+}
+
+int32_t boltffi_ni_boltffi_method_record_demo_named_rename(const uint8_t *receiver_ptr, uintptr_t receiver_len, FfiBuf_u8 *receiver_out, const uint8_t *name_ptr, uintptr_t name_len) {
+    return boltffi_method_record_demo_named_rename(receiver_ptr, receiver_len, receiver_out, name_ptr, name_len).code;
+}
+
+void boltffi_ni_boltffi_function_demo_greet(const uint8_t *name_ptr, uintptr_t name_len, FfiBuf_u8 *__out) {
+    *__out = boltffi_function_demo_greet(name_ptr, name_len);
+}
+
+void boltffi_ni_boltffi_function_demo_describe(const uint8_t *value_ptr, uintptr_t value_len, FfiBuf_u8 *__out) {
+    *__out = boltffi_function_demo_describe(value_ptr, value_len);
+}

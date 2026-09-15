@@ -34,11 +34,11 @@ impl ShimFunction {
             .lib_params()
             .iter()
             .map(|parameter| {
-                Ok(format!(
-                    "{} {}",
-                    TypeFragment::anonymous(parameter.c_type())?,
-                    parameter.name().as_str()
-                ))
+                let ty = TypeFragment::anonymous(parameter.c_type())?.to_string();
+                Ok(match ty.ends_with('*') {
+                    true => format!("{ty}{}", parameter.name().as_str()),
+                    false => format!("{ty} {}", parameter.name().as_str()),
+                })
             })
             .collect::<Result<Vec<_>>>()?
             .join(", ");

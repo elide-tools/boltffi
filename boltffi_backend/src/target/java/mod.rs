@@ -9,7 +9,7 @@ mod runtime;
 mod syntax;
 mod version;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use boltffi_binding::{
     Bindings, CallbackDecl, ClassDecl, ConstantDecl, CustomTypeDecl, DeclarationRef, EnumDecl,
@@ -113,7 +113,7 @@ impl JavaHost {
             self.native_libraries = self
                 .native_libraries
                 .with_desktop_loader(JavaDesktopLoader::None);
-            if self.c_header == PathBuf::from("jni/boltffi.h") {
+            if self.c_header == Path::new("jni/boltffi.h") {
                 self.c_header = PathBuf::from("native_image/boltffi.h");
             }
         }

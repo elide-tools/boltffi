@@ -4,7 +4,7 @@ use askama::Template as AskamaTemplate;
 
 use crate::core::{BackendError, Result};
 
-use super::contract::{Downcall, NativeImageContract, WrapperBody};
+use super::contract::{NativeImageContract, Wrapper as WrapperContract};
 
 #[derive(AskamaTemplate)]
 #[template(path = "bridge/native_image/native_image.java", escape = "none")]
@@ -15,8 +15,8 @@ struct JavaFile<'contract> {
 
 #[derive(AskamaTemplate)]
 #[template(path = "bridge/native_image/wrapper.java", escape = "none")]
-struct Wrapper<'downcall> {
-    downcall: &'downcall Downcall,
+struct Wrapper<'wrapper> {
+    wrapper: &'wrapper WrapperContract,
 }
 
 #[derive(AskamaTemplate)]
@@ -25,27 +25,20 @@ struct Glue<'contract> {
     contract: &'contract NativeImageContract,
 }
 
-impl Wrapper<'_> {
-    fn scalar(&self) -> bool {
-        matches!(self.downcall.body(), WrapperBody::Scalar)
-    }
-}
-
 /// Renders `BoltFFINativeImage.java`.
 pub(super) fn render_java(contract: &NativeImageContract) -> Result<String> {
     let wrappers = contract
         .downcalls()
         .iter()
-        .map(|downcall| Wrapper { downcall }.render().map_err(BackendError::from))
+        .filter_map(|downcall| downcall.wrapper())
+        .map(|wrapper| Wrapper { wrapper }.render().map_err(BackendError::from))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     JavaFile { contract, wrappers }
         .render()
-        .map_err(|error| BackendError::from(error).into())
+        .map_err(BackendError::from)
 }
 
 /// Renders the pointer-ABI glue shim.
 pub(super) fn render_glue(contract: &NativeImageContract) -> Result<String> {
-    Glue { contract }
-        .render()
-        .map_err(|error| BackendError::from(error).into())
+    Glue { contract }.render().map_err(BackendError::from)
 }
