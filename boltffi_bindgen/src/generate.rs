@@ -9,7 +9,7 @@ use boltffi_backend::target::{
     c::CHost,
     csharp::CSharpHost,
     dart::DartHost,
-    java::{JavaDesktopLoader, JavaHost, JavaVersion},
+    java::{JavaDesktopLoader, JavaHost, JavaVersion, JvmBinding},
     kmp::{DEFAULT_KMP_MODULE_NAME, DEFAULT_KMP_PACKAGE_NAME, KmpHost, KmpSupportMode},
     kotlin::{KotlinApiStyle, KotlinDesktopLoader, KotlinFactoryStyle, KotlinHost},
     python::PythonCExtHost,
@@ -55,6 +55,7 @@ pub struct Generation {
     java_desktop_fallback_library: Option<String>,
     java_c_header: Option<PathBuf>,
     java_desktop_loader: JavaDesktopLoader,
+    java_jvm_binding: JvmBinding,
     java_version: JavaVersion,
     kotlin_package: Option<String>,
     kotlin_file: Option<String>,
@@ -108,6 +109,7 @@ impl Generation {
             java_desktop_fallback_library: None,
             java_c_header: None,
             java_desktop_loader: JavaDesktopLoader::default(),
+            java_jvm_binding: JvmBinding::default(),
             java_version: JavaVersion::default(),
             kotlin_package: None,
             kotlin_file: None,
@@ -242,6 +244,12 @@ impl Generation {
     /// Sets how the generated Java module loads desktop native libraries.
     pub fn java_desktop_loader(mut self, loader: JavaDesktopLoader) -> Self {
         self.java_desktop_loader = loader;
+        self
+    }
+
+    /// Sets how generated Java reaches the C ABI (JNI or GraalVM Native Image).
+    pub fn java_jvm_binding(mut self, binding: JvmBinding) -> Self {
+        self.java_jvm_binding = binding;
         self
     }
 
@@ -500,6 +508,7 @@ impl Generation {
     fn java_host(&self, package: &str, file: &str) -> Result<JavaHost, GenerationError> {
         let host = JavaHost::for_version(package, file, self.java_version)
             .map_err(GenerationError::Render)?
+            .binding(self.java_jvm_binding)
             .desktop_loader(self.java_desktop_loader);
         let host = self
             .java_android_library

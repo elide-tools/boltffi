@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use boltffi_backend::target::java::JavaDesktopLoader;
+use boltffi_backend::target::java::{JavaDesktopLoader, JvmBinding};
 use boltffi_backend::target::jvm::{LibraryName, NativeLibraries};
 use boltffi_backend::target::kmp::{KMP_SUPPORT_REPORT_FILE, KmpSupportMode};
 use boltffi_backend::target::kotlin::{
@@ -20,7 +20,7 @@ use crate::build::BindingExpansion;
 use crate::cargo::Cargo;
 use crate::cli::{CliError, Result};
 use crate::config::{
-    Config, KotlinFactoryStyle, SpmLayout,
+    Config, JavaJvmBinding, KotlinFactoryStyle, SpmLayout,
     targets::kotlin::{KotlinApiStyle, KotlinDesktopLoader},
 };
 use crate::toolchain::{AndroidToolchain, NativeHostToolchain};
@@ -308,9 +308,18 @@ fn write_java(
     let target_name = bindgen_target.name();
     let libraries = NativeLibraries::from_artifact(artifact_name)
         .map_err(|error| generation_error(target_name, GenerationError::Render(error)))?;
-    let desktop_loader = match plan.platform().uses_desktop_loader() {
+    let binding = match config.java_jvm_binding() {
+        JavaJvmBinding::Jni => JvmBinding::Jni,
+        JavaJvmBinding::NativeImage => JvmBinding::NativeImage,
+    };
+    let native_image = matches!(binding, JvmBinding::NativeImage);
+    let desktop_loader = match !native_image && plan.platform().uses_desktop_loader() {
         true => JavaDesktopLoader::Bundled,
         false => JavaDesktopLoader::None,
+    };
+    let c_header = match native_image {
+        true => PathBuf::from("native_image").join("boltffi.h"),
+        false => PathBuf::from("jni").join(format!("{artifact_name}.h")),
     };
     let mut outputs = generations.into_iter().map(|generation| {
         let (target_label, generation) = generation.into_parts();
@@ -322,8 +331,9 @@ fn write_java(
             .java_desktop_jni_library(libraries.desktop_jni().as_str())
             .java_desktop_fallback_library(libraries.desktop_fallback().as_str())
             .java_desktop_loader(desktop_loader)
+            .java_jvm_binding(binding)
             .java_version(plan.version())
-            .java_c_header(PathBuf::from("jni").join(format!("{artifact_name}.h")))
+            .java_c_header(c_header.clone())
             .render(bindgen_target)
             .map_err(|error| target_generation_error(target_name, &target_label, error))
             .map(|output| RenderedJava {
