@@ -521,6 +521,12 @@ tasks.test {
 }
 ```
 
+### Native Image Backend
+
+For GraalVM Native Image applications, BoltFFI can generate bindings that use the Native Image C API instead of JNI. The Rust library is statically linked into the native image, eliminating JNI overhead. The public Java API (functions, records, callbacks) is identical to the JNI backend; only the internal implementation changes.
+
+See the [Native Image Backend guide](/docs/native-image) for configuration, requirements (GraalVM 25+, `staticlib`), the packaging flow, compiler directives, and troubleshooting.
+
 <h2 id="c-sharp-packaging">C# Packaging</h2>
 
 Package everything for .NET:

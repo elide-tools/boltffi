@@ -1,0 +1,195 @@
+---
+title: "Native Image Backend"
+description: "Call BoltFFI Rust libraries from GraalVM Native Image applications using the C API instead of JNI."
+---
+
+# Native Image Backend
+
+The Native Image backend lets GraalVM Native Image applications call BoltFFI-generated Rust libraries through the Native Image C API instead of JNI. The Rust library is statically linked into the native image, eliminating dynamic library loading and JNI overhead. The public Java API (functions, records, enums, callbacks) is identical to the JNI backend; only the internal implementation changes.
+
+## When to Use Native Image
+
+Use the Native Image backend when:
+
+- Your application must run as a GraalVM Native Image (not on standard JVM/HotSpot)
+- You want to avoid JNI and its overhead
+- You are building a self-contained binary that includes the Rust library statically
+
+The Native Image backend does **not** run on HotSpot or standard Java runtimes. If you need JVM and Native Image support in the same package, build both backends separately.
+
+## Configuration
+
+Enable the Native Image backend in `boltffi.toml`:
+
+```toml
+[targets.java.jvm]
+enabled = true
+binding = "native-image"
+```
+
+The default `binding` is `"jni"`. Only one binding per Java target is allowed. When using Native Image, the public API you write in Rust remains unchanged; BoltFFI generates different internal implementation.
+
+## Requirements
+
+- **GraalVM 25 or newer**
+- **Rust `staticlib`** — Your `Cargo.toml` must list:
+  ```toml
+  [lib]
+  crate-type = ["staticlib"]
+  ```
+- **Java compilation environment** — `JAVA_HOME` set to your GraalVM installation
+- **C compiler** — `clang` or system C compiler for the glue layer
+
+## Build and Packaging Flow
+
+When you run `boltffi pack java` with the Native Image backend enabled, BoltFFI:
+
+1. **Builds the Rust crate** as a `staticlib` static archive
+2. **Generates Java sources** including a package-private `Native` class with C API declarations
+3. **Compiles the C shim layer** (`native_image_glue.c`) into a second static archive to bridge by-value structs that the C API cannot express directly
+4. **Stages the artifacts** under `dist/java/native/`:
+   - The Rust static library (`lib<name>.a`)
+   - The C shim static library
+   - Generated C headers (`boltffi.h` and `native_image_glue.h`)
+   - Generated Java sources
+
+### Output Structure
+
+```
+dist/java/
+├── com/example/mylib/
+│   ├── MyLib.java          # Functions module (API unchanged from JNI)
+│   ├── Native.java         # C API declarations (package-private)
+│   ├── Directives.java     # Header and include path directives
+│   ├── Lib.java            # @CFunction declarations
+│   ├── Demo.java           # Your exported class (unchanged)
+│   └── ... (records, enums, callbacks, etc.)
+├── META-INF/
+│   └── native-image/
+│       └── com/example/mylib/
+│           └── native-image.properties  # Native Image configuration
+└── native/
+    ├── libyourlib.a                 # Rust staticlib
+    ├── libyourlib_ni.a              # C shim staticlib
+    ├── boltffi.h                    # Main C header
+    └── native_image_glue.h          # C shim header
+```
+
+## The native-image.properties File
+
+BoltFFI generates `META-INF/native-image/<group>/<artifact>/native-image.properties` automatically. It contains the compile-time directives that Native Image needs to link your library, locate its headers, and access GraalVM internals:
+
+```properties
+Args = -H:CLibraryPath=<path-to-native-dir> \
+  -Dboltffi.include=<path-to-native-dir> \
+  --add-exports org.graalvm.nativeimage.guest.staging/com.oracle.svm.guest.staging.c.function=ALL-UNNAMED \
+  --add-exports org.graalvm.nativeimage.guest.staging/com.oracle.svm.guest.staging.c=ALL-UNNAMED \
+  --add-exports org.graalvm.nativeimage.shared/com.oracle.svm.shared=ALL-UNNAMED
+```
+
+- `-H:CLibraryPath` tells the `native-image` tool where to find the static libraries
+- `-Dboltffi.include` is read at image build time by the generated `Directives` class to locate headers
+- The three `--add-exports` flags give the generated code access to GraalVM's internal C API support classes
+
+Native Image reads this file automatically when it encounters the generated classes on the image classpath. No manual configuration is needed if you follow the standard build flow.
+
+### Manual Compilation (Without Properties File)
+
+If you are building the native image manually without using the properties file, pass all the same flags to `native-image`:
+
+```bash
+native-image \
+  -cp classes:$GRAALVM_HOME/lib/svm/builder/svm-guest-staging.jar:$GRAALVM_HOME/lib/svm/builder/svm-shared.jar \
+  --add-exports org.graalvm.nativeimage.guest.staging/com.oracle.svm.guest.staging.c.function=ALL-UNNAMED \
+  --add-exports org.graalvm.nativeimage.guest.staging/com.oracle.svm.guest.staging.c=ALL-UNNAMED \
+  --add-exports org.graalvm.nativeimage.shared/com.oracle.svm.shared=ALL-UNNAMED \
+  -H:CLibraryPath=dist/java/native \
+  -Dboltffi.include=dist/java/native \
+  -o app \
+  com.example.Main
+```
+
+## Compiling Generated Java Sources
+
+Before building a native image, you must compile the generated Java sources and the GraalVM staging JARs together with `javac`:
+
+```bash
+javac \
+  -cp $GRAALVM_HOME/lib/svm/builder/svm-guest-staging.jar:$GRAALVM_HOME/lib/svm/builder/svm-shared.jar \
+  -d classes \
+  dist/java/com/example/mylib/*.java
+```
+
+The staging JARs provide the C API annotation types (`@CFunction`, `@CContext`, `@CEntryPoint`, etc.) and internal classes that the generated code uses.
+
+If the classpath is missing or incomplete:
+- Compilation will fail with `cannot find symbol` errors for `CFunction`, `CContext`, etc.
+- `IllegalAccessError` at image build time if you build without `--add-exports`
+
+## Callbacks and Thread Attachment
+
+When Rust calls back into Java (from callbacks, closures, or stream callbacks), the calling thread is automatically attached to the JVM isolate on first use. This attachment happens transparently; your Java callback code does not need to manage thread setup. The thread stays attached for the lifetime of the process.
+
+This is safe to use from Rust threads spawned in your library; the thread-attach prologue handles synchronization with the image's isolate.
+
+## Limitations
+
+- **Native Image only** — The generated code runs only in a GraalVM Native Image, not on HotSpot or other Java runtimes.
+- **Staticlib required** — The Rust library must be a `staticlib` and is always statically linked. No dynamic loading.
+- **GraalVM 25+ only** — Earlier versions do not have the required internal C API support.
+- **Internal API dependency** — The generated code uses internal GraalVM classes (`CEntryPointOptions`, `CEntryPointActions`, etc.). These are expected to become public API, but are currently internal. A GraalVM package rename requires updating one template in the code generator; a module migration is a one-line change.
+- **No pointer-native API** — The public Java API remains high-level (records, enums, handles). Pointer types like `PointerBase` and `StackValue` are generated for internal use only.
+
+## Troubleshooting
+
+**Header not found during image build**
+
+If you see errors like `boltffi.h: No such file or directory` during `native-image` compilation, check the `-Dboltffi.include` property:
+
+```bash
+# Verify the path exists and contains boltffi.h
+ls -la dist/java/native/boltffi.h
+```
+
+Ensure the path matches the directory where `boltffi pack java` staged the headers.
+
+**Unresolved symbol: `boltffi_ni_*`**
+
+The C shim symbols are not found at link time. This happens when the shim static library (`libyourlib_ni.a`) is not linked into the final archive or the `-H:CLibraryPath` does not point to its location.
+
+Verify:
+- The shim archive exists: `ls -la dist/java/native/libyourlib_ni.a`
+- The `-H:CLibraryPath` includes the directory containing both archives
+- The properties file or manual `native-image` invocation passes both libraries
+
+**IllegalAccessError: `CEntryPointOptions` not accessible**
+
+This error at image build time means the three `--add-exports` flags are missing. Add them to your `native-image` command or verify the properties file was processed:
+
+```bash
+grep "add-exports" META-INF/native-image/com/example/mylib/native-image.properties
+```
+
+If the properties file exists but the flags are not applied, check that the generated classes are on the image classpath when you invoke `native-image`.
+
+**Cannot find symbol during javac**
+
+If `javac` cannot find `CFunction`, `CContext`, or other C API types, the GraalVM builder JARs are missing from the classpath:
+
+```bash
+# Verify the JARs exist
+ls -la $GRAALVM_HOME/lib/svm/builder/svm-guest-staging.jar
+ls -la $GRAALVM_HOME/lib/svm/builder/svm-shared.jar
+```
+
+Add them to your `javac -cp` command and recompile.
+
+---
+
+## Next Steps
+
+- Configure your `boltffi.toml` with `[targets.java.jvm] binding = "native-image"`
+- Run `boltffi pack java` to generate the sources and artifacts
+- Compile with `javac`, passing the GraalVM builder JARs
+- Build your native image with `native-image`, passing the directives from the properties file or command line
+- Your Rust library is now statically linked and callable from your Native Image binary

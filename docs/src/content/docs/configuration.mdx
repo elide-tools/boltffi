@@ -529,6 +529,20 @@ output = "dist/java/symbols"
 
 For release-like packaging profiles, BoltFFI requires Cargo debuginfo to be enabled before it will emit this archive. On Windows MSVC hosts, the archive also includes sibling `.pdb` files for the JNI DLL and any bundled Rust DLL when those sidecars exist.
 
+### JVM Binding: JNI vs. Native Image
+
+By default, BoltFFI generates JNI bindings for JVM targets. To generate bindings for GraalVM Native Image instead, set the `binding` option:
+
+```toml
+[targets.java.jvm]
+enabled = true
+binding = "native-image"
+```
+
+The default is `binding = "jni"`. When `binding = "native-image"`, the Rust library is compiled as a `staticlib` and statically linked into the native image. The public Java API (functions, records, callbacks) remains identical; only the internal implementation changes.
+
+See the [Native Image Backend guide](/docs/native-image) for full details on configuration, requirements, and the build process.
+
 ### Android Target
 
 Enable Android packaging to produce shared libraries for all Android ABIs:
