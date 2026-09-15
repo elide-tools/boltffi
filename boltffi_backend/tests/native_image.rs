@@ -240,6 +240,7 @@ fn dump_fixture() {
         Ok("vectors") => DIRECT_VECTORS,
         Ok("callbacks") => CALLBACKS,
         Ok("handles") => CALLBACK_HANDLES,
+        Ok("closures") => CLOSURES,
         _ => PRIMITIVE_FUNCTIONS,
     };
     eprintln!("{}", rendered(source));
@@ -319,5 +320,56 @@ fn renders_rust_owned_callback_handle_methods() {
         out.contains("long __boltffi_child_handle = storeOwnedHandle((CallbackHandle) child);")
     );
     assert!(out.contains("ParentCallbacks.on_child(__cell.token(), __boltffi_child_handle);"));
+    insta::assert_snapshot!(out);
+}
+
+const CLOSURES: &str = r#"
+    #[error]
+    pub enum MathError { Invalid }
+
+    #[repr(C)]
+    #[data]
+    pub struct Point { pub x: f64, pub y: f64 }
+
+    #[export]
+    pub fn apply(callback: impl Fn(i32) -> i32, value: i32) -> i32 { callback(value) }
+
+    #[export]
+    pub fn apply_text(callback: impl Fn(String) -> String, value: String) -> String {
+        callback(value)
+    }
+
+    #[export]
+    pub fn apply_point(callback: impl Fn(Point) -> Point, value: Point) -> Point { callback(value) }
+
+    #[export]
+    pub fn apply_fallible(callback: impl Fn(i32) -> Result<i32, MathError>, value: i32) -> i32 {
+        callback(value).unwrap_or(0)
+    }
+"#;
+
+#[test]
+fn renders_closure_trampolines_and_address_accessors() {
+    let out = rendered(CLOSURES);
+    // the downcall wrapper builds the triple from two glue accessors and a handle cell
+    assert!(out.contains("static int boltffi_function_demo_apply(long callback, int value) {"));
+    assert!(out.contains("return Lib.boltffi_function_demo_apply(Lib.boltffi_ni_closure____closure__i32_to_i32_call(), WordFactory.pointer(newHandleCell(callback)), Lib.boltffi_ni_closure____closure__i32_to_i32_release(), value);"));
+    assert!(out.contains("static native org.graalvm.word.PointerBase boltffi_ni_closure____closure__i32_to_i32_call();"));
+    // one entry point per signature for call and release, both behind the attach prologue
+    assert!(out.contains("@CEntryPoint(name = \"boltffi_ni_java____closure__i32_to_i32_call\")"));
+    assert!(out.contains("static int ___closure__i32_to_i32_call(HandleCell __cell, int arg0) {"));
+    assert!(out.contains("return ClosureI32ToI32Callbacks.call(__cell.token(), arg0);"));
+    assert!(out.contains("ClosureI32ToI32Callbacks.free(__cell.token());"));
+    assert!(out.contains("UnmanagedMemory.free(__cell);"));
+    // by-value structs travel behind pointers in both directions
+    assert!(out.contains(
+        "byte[] __boltffi_arg0_array = copyRecord(arg0, SizeOf.get(___PointStruct.class));"
+    ));
+    assert!(out.contains("static ___Point boltffi_ni____closure__demo_point_to_demo_point_call_shim(void *__context, ___Point arg0) {"));
+    assert!(out.contains("byte[] arg0 = copyBytes(arg0_ptr, arg0_len);"));
+    // the fallible closure writes its success value through the out pointer it was handed
+    assert!(out.contains("ClosureI32ToResultI32ErrDemoMathErrorCallbacks.call(__cell.token(), arg0, return_out.rawValue());"));
+    // the glue hands Java the forwarder addresses
+    assert!(out.contains("void *boltffi_ni_closure____closure__i32_to_i32_call(void) {\n    return (void *)boltffi_ni____closure__i32_to_i32_call_shim;\n}"));
     insta::assert_snapshot!(out);
 }

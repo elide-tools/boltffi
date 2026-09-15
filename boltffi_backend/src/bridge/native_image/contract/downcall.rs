@@ -15,15 +15,18 @@ use crate::{
     bridge::{
         c::{self, Identifier},
         jni::{
-            BytesParameter, CallbackHandleLifecycle, CallbackHandleMethod, DirectVectorParameter,
-            JniType, NativeMethod, NativeParameter, NativeParameterKind, NativeReturn,
-            RecordParameter, SuccessOutReturn, SuccessOutValue, SuccessOutWriter,
+            BytesParameter, CallbackHandleLifecycle, CallbackHandleMethod,
+            ClosureParameter as JniClosureParameter, DirectVectorParameter, JniType, NativeMethod,
+            NativeParameter, NativeParameterKind, NativeReturn, RecordParameter, SuccessOutReturn,
+            SuccessOutValue, SuccessOutWriter,
         },
     },
     core::{Error, Result},
 };
 
-use super::{super::NATIVE_IMAGE_BRIDGE, JavaCType, ShimFunction, shim::Pointerized};
+use super::{
+    super::NATIVE_IMAGE_BRIDGE, ClosureUpcall, JavaCType, ShimFunction, shim::Pointerized,
+};
 
 /// Thread state transition performed around a `@CFunction` call.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -283,6 +286,7 @@ impl Downcall {
         method: &NativeMethod,
         transition: Transition,
         callbacks: &[c::Callback],
+        closures: &[ClosureUpcall],
     ) -> Result<Self> {
         let mut downcall = Self::from_c_function(method.c_function(), transition)?;
         let wrapper = WrapperBuilder {
@@ -294,6 +298,7 @@ impl Downcall {
             success_out: method.success_out(),
             receiver: false,
             callbacks,
+            closures,
         }
         .build()?;
         downcall.wrapper = Some(wrapper);
@@ -308,6 +313,7 @@ impl Downcall {
         method: &CallbackHandleMethod,
         transition: Transition,
         callbacks: &[c::Callback],
+        closures: &[ClosureUpcall],
     ) -> Result<Self> {
         if method.completion().is_some() {
             return Err(Self::unsupported("asynchronous callback handle method"));
@@ -370,6 +376,7 @@ impl Downcall {
             success_out: method.success_out(),
             receiver: true,
             callbacks,
+            closures,
         }
         .build()?;
         downcall.wrapper = Some(wrapper);
@@ -472,6 +479,7 @@ struct WrapperBuilder<'a> {
     /// Whether a leading `long handle` names a Rust-owned callback to dispatch through.
     receiver: bool,
     callbacks: &'a [c::Callback],
+    closures: &'a [ClosureUpcall],
 }
 
 impl WrapperBuilder<'_> {
@@ -571,8 +579,8 @@ impl WrapperBuilder<'_> {
                             marshalled.arguments.push(local);
                             params.push(token);
                         }
-                        NativeParameterKind::Closure(_) => {
-                            return Err(Downcall::unsupported("closure parameter"));
+                        NativeParameterKind::Closure(closure) => {
+                            self.closure(closure, &mut params, &mut marshalled)?;
                         }
                         NativeParameterKind::Continuation(_) => {
                             return Err(Downcall::unsupported("async continuation parameter"));
@@ -603,6 +611,45 @@ impl WrapperBuilder<'_> {
             self.downcall.lib_name().as_str(),
             marshalled.arguments.join(", ")
         )
+    }
+
+    /// Passes a Java closure token to C as a `(call, cell, release)` triple.
+    fn closure(
+        &self,
+        closure: &JniClosureParameter,
+        params: &mut Vec<WrapperParameter>,
+        marshalled: &mut Marshalled,
+    ) -> Result<()> {
+        let arguments = closure.c_arguments();
+        let call =
+            arguments
+                .first()
+                .map(ToString::to_string)
+                .ok_or(Error::BrokenBridgeContract {
+                    bridge: NATIVE_IMAGE_BRIDGE,
+                    invariant: "closure parameter passes a call function pointer",
+                })?;
+        let upcall = self
+            .closures
+            .iter()
+            .find(|upcall| upcall.jni_call() == call)
+            .ok_or(Error::BrokenBridgeContract {
+                bridge: NATIVE_IMAGE_BRIDGE,
+                invariant: "closure parameter names a registered closure signature",
+            })?;
+        let token = WrapperParameter::new(closure.name().as_str(), "long");
+        marshalled
+            .arguments
+            .push(format!("Lib.{}()", upcall.call_address()));
+        marshalled.arguments.push(format!(
+            "WordFactory.pointer(newHandleCell({}))",
+            token.name
+        ));
+        marshalled
+            .arguments
+            .push(format!("Lib.{}()", upcall.release_address()));
+        params.push(token);
+        Ok(())
     }
 
     fn bytes(

@@ -42,6 +42,23 @@ pub struct Trampoline {
 }
 
 impl Trampoline {
+    /// Creates one `@CEntryPoint` trampoline.
+    pub(super) fn new(
+        entry_symbol: String,
+        java_name: String,
+        java_params: String,
+        java_returns: JavaCType,
+        body: Vec<String>,
+    ) -> Self {
+        Self {
+            entry_symbol,
+            java_name,
+            java_params,
+            java_returns,
+            body,
+        }
+    }
+
     /// Returns the exported symbol name.
     pub fn entry_symbol(&self) -> &str {
         &self.entry_symbol
@@ -202,6 +219,9 @@ impl CallbackUpcall {
         if slot.is_asynchronous() {
             return Err(unsupported("asynchronous callback method"));
         }
+        if method.returns_closure() {
+            return Err(unsupported("callback method returning a closure"));
+        }
         let function = method.function().as_str().to_owned();
         let entry = format!("boltffi_ni_java_{function}");
         // Slot parameters after the leading handle.
@@ -285,63 +305,7 @@ impl CallbackUpcall {
             arguments.join(", ")
         );
 
-        let mut body = Vec::new();
-        let failure;
-        if method.returns_callback_handle() || method.returns_closure() {
-            return Err(unsupported("callback method returning a handle"));
-        }
-        if pointerized.out_param {
-            match slot.returns() {
-                c::Type::Buffer => {
-                    body.push("zeroBuffer((FfiBuf) __out);".to_owned());
-                    body.push("try {".to_owned());
-                    body.extend(setup.iter().map(|line| format!("    {line}")));
-                    body.push(format!("    byte[] __value = {call};"));
-                    body.push("    writeBuffer((FfiBuf) __out, __value);".to_owned());
-                }
-                c::Type::DirectRecord(id) => {
-                    body.push(format!(
-                        "zeroMemory(__out, SizeOf.get({}Struct.class));",
-                        id.as_str()
-                    ));
-                    body.push("try {".to_owned());
-                    body.extend(setup.iter().map(|line| format!("    {line}")));
-                    body.push(format!("    byte[] __value = {call};"));
-                    body.push(format!(
-                        "    writeRecord(__out, __value, SizeOf.get({}Struct.class));",
-                        id.as_str()
-                    ));
-                }
-                _ => return Err(unsupported("callback method returning this struct")),
-            }
-            failure = None;
-        } else if pointerized.status_return {
-            body.push("try {".to_owned());
-            body.extend(setup.iter().map(|line| format!("    {line}")));
-            body.push(format!("    return {call};"));
-            failure = Some("1".to_owned());
-        } else if pointerized.returns.is_void() {
-            body.push("try {".to_owned());
-            body.extend(setup.iter().map(|line| format!("    {line}")));
-            body.push(format!("    {call};"));
-            failure = None;
-        } else {
-            body.push("try {".to_owned());
-            body.extend(setup.iter().map(|line| format!("    {line}")));
-            body.push(format!("    return {call};"));
-            failure = Some(match pointerized.returns {
-                JavaCType::Boolean => "false".to_owned(),
-                JavaCType::Float => "0.0f".to_owned(),
-                JavaCType::Double => "0.0".to_owned(),
-                _ => "0".to_owned(),
-            });
-        }
-        body.push("} catch (Throwable __failure) {".to_owned());
-        match &failure {
-            Some(value) => body.push(format!("    return {value};")),
-            None => body.push("    // Failure leaves the zeroed output in place.".to_owned()),
-        }
-        body.push("}".to_owned());
+        let body = trampoline_body(&call, &setup, &pointerized, slot.returns(), None)?;
 
         let trampoline = Trampoline {
             entry_symbol: entry.clone(),
@@ -439,7 +403,85 @@ impl CallbackUpcall {
     }
 }
 
-fn copy_helper(ty: JniType) -> &'static str {
+/// Renders the guarded Java statements of one upcall trampoline.
+///
+/// Every upcall body has the same shape: zero any output storage, run the
+/// argument conversions, call the host dispatcher, and swallow a Java failure
+/// into the C failure value, because there is no exception channel into Rust.
+pub(super) fn trampoline_body(
+    call: &str,
+    setup: &[String],
+    pointerized: &Pointerized,
+    returns: &c::Type,
+    callback_handle_helper: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut body = Vec::new();
+    let failure;
+    if pointerized.out_param {
+        match returns {
+            c::Type::Buffer => {
+                body.push("zeroBuffer((FfiBuf) __out);".to_owned());
+                body.push("try {".to_owned());
+                body.extend(setup.iter().map(|line| format!("    {line}")));
+                body.push(format!("    byte[] __value = {call};"));
+                body.push("    writeBuffer((FfiBuf) __out, __value);".to_owned());
+            }
+            c::Type::DirectRecord(id) => {
+                body.push(format!(
+                    "zeroMemory(__out, SizeOf.get({}Struct.class));",
+                    id.as_str()
+                ));
+                body.push("try {".to_owned());
+                body.extend(setup.iter().map(|line| format!("    {line}")));
+                body.push(format!("    byte[] __value = {call};"));
+                body.push(format!(
+                    "    writeRecord(__out, __value, SizeOf.get({}Struct.class));",
+                    id.as_str()
+                ));
+            }
+            c::Type::CallbackHandle(_) => {
+                let helper = callback_handle_helper
+                    .ok_or_else(|| unsupported("callback handle returned by this upcall"))?;
+                body.push("zeroCallbackHandle((CallbackHandle) __out);".to_owned());
+                body.push("try {".to_owned());
+                body.extend(setup.iter().map(|line| format!("    {line}")));
+                body.push(format!("    long __token = {call};"));
+                body.push(format!("    {helper}(__token, (CallbackHandle) __out);"));
+            }
+            _ => return Err(unsupported("upcall returning this struct")),
+        }
+        failure = None;
+    } else if pointerized.status_return {
+        body.push("try {".to_owned());
+        body.extend(setup.iter().map(|line| format!("    {line}")));
+        body.push(format!("    return {call};"));
+        failure = Some("1".to_owned());
+    } else if pointerized.returns.is_void() {
+        body.push("try {".to_owned());
+        body.extend(setup.iter().map(|line| format!("    {line}")));
+        body.push(format!("    {call};"));
+        failure = None;
+    } else {
+        body.push("try {".to_owned());
+        body.extend(setup.iter().map(|line| format!("    {line}")));
+        body.push(format!("    return {call};"));
+        failure = Some(match pointerized.returns {
+            JavaCType::Boolean => "false".to_owned(),
+            JavaCType::Float => "0.0f".to_owned(),
+            JavaCType::Double => "0.0".to_owned(),
+            _ => "0".to_owned(),
+        });
+    }
+    body.push("} catch (Throwable __failure) {".to_owned());
+    match &failure {
+        Some(value) => body.push(format!("    return {value};")),
+        None => body.push("    // Failure leaves the zeroed output in place.".to_owned()),
+    }
+    body.push("}".to_owned());
+    Ok(body)
+}
+
+pub(super) fn copy_helper(ty: JniType) -> &'static str {
     match ty {
         JniType::Boolean => "copyBooleans",
         JniType::Byte => "copyBytes",
@@ -451,7 +493,7 @@ fn copy_helper(ty: JniType) -> &'static str {
     }
 }
 
-fn unsupported(shape: &'static str) -> Error {
+pub(super) fn unsupported(shape: &'static str) -> Error {
     Error::UnsupportedTarget {
         target: NATIVE_IMAGE_BRIDGE,
         shape,

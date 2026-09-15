@@ -149,6 +149,11 @@
     }
 {%- endfor %}
 
+    static void zeroCallbackHandle(CallbackHandle handle) {
+        handle.handle(0L);
+        handle.vtable(WordFactory.nullPointer());
+    }
+
     static void zeroBuffer(FfiBuf buffer) {
         buffer.ptr(WordFactory.nullPointer());
         buffer.len(0L);

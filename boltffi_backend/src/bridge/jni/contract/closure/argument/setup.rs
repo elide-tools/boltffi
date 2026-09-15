@@ -9,7 +9,7 @@
 
 use super::{
     ClosureArgument, ClosureArgumentKind, ClosureBytesArgument, ClosureDirectVectorArgument,
-    ClosureHandleArgument, ClosureRecordArgument,
+    ClosureHandleArgument, ClosureRecordArgument, ClosureScalarArgument,
 };
 
 use crate::bridge::jni::SuccessOutArgument;
@@ -24,6 +24,18 @@ impl ClosureArgument {
             | ClosureArgumentKind::DirectVector(_)
             | ClosureArgumentKind::Record(_)
             | ClosureArgumentKind::Closure(_) => None,
+        }
+    }
+
+    /// Returns the scalar argument when this closure argument is one C value.
+    pub fn call_scalar(&self) -> Option<&ClosureScalarArgument> {
+        match &self.kind {
+            ClosureArgumentKind::Scalar(argument) => Some(argument),
+            ClosureArgumentKind::Bytes(_)
+            | ClosureArgumentKind::DirectVector(_)
+            | ClosureArgumentKind::Record(_)
+            | ClosureArgumentKind::Closure(_)
+            | ClosureArgumentKind::SuccessOut(_) => None,
         }
     }
 
