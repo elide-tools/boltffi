@@ -8,6 +8,7 @@
 mod downcall;
 mod java_type;
 mod shim;
+mod upcall;
 
 use crate::{
     bridge::{
@@ -18,8 +19,12 @@ use crate::{
 };
 
 pub use downcall::{Downcall, LibParameter, Transition, Wrapper, WrapperParameter};
+
+/// Glue function that registers every callback vtable with Rust.
+pub const REGISTER_CALLBACKS: &str = "boltffi_ni_register_callbacks";
 pub use java_type::JavaCType;
 pub use shim::ShimFunction;
+pub use upcall::{CallbackUpcall, Trampoline};
 
 use super::bridge::TransitionPolicy;
 
@@ -36,6 +41,9 @@ pub struct NativeImageContract {
     shims: Vec<ShimFunction>,
     direct_records: Vec<String>,
     free_buffer: String,
+    buffer_from_bytes: String,
+    callbacks: Vec<CallbackUpcall>,
+    glue_header_file: String,
 }
 
 impl NativeImageContract {
@@ -55,32 +63,83 @@ impl NativeImageContract {
             })?;
         let transition = policy.resolve(c_bridge);
         let free_buffer_function = c_bridge.support().buffer_free()?;
-        let support = [free_buffer_function]
+        let buffer_from_bytes_function = c_bridge.support().buffer_from_bytes()?;
+        let support = [free_buffer_function, buffer_from_bytes_function]
             .into_iter()
             .map(|function| Downcall::from_c_function(function, Transition::NoTransition));
-        let downcalls = support
-            .chain(
-                jvm.methods()
-                    .iter()
-                    .map(|method| Downcall::from_native_method(method, transition)),
-            )
+        let create_handles = c_bridge
+            .callbacks()
+            .iter()
+            .map(|callback| Downcall::from_c_function(callback.create_handle(), transition));
+        let register_all = (!c_bridge.callbacks().is_empty())
+            .then(|| {
+                c::Function::new(REGISTER_CALLBACKS, Vec::new(), c::Type::Void)
+                    .and_then(|function| Downcall::from_c_function(&function, transition))
+            })
+            .transpose()?;
+        let mut downcalls = support
+            .chain(create_handles)
+            .chain(register_all.map(Ok))
+            .chain(jvm.methods().iter().map(|method| {
+                Downcall::from_native_method(method, transition, c_bridge.callbacks())
+            }))
             .collect::<Result<Vec<_>>>()?;
-        let free_buffer = downcalls
-            .first()
-            .map(|downcall| downcall.lib_name().as_str().to_owned())
-            .unwrap_or_default();
+        let free_buffer = downcalls[0].lib_name().as_str().to_owned();
+        let buffer_from_bytes = downcalls[1].lib_name().as_str().to_owned();
+        let callbacks = jvm
+            .callbacks()
+            .iter()
+            .zip(c_bridge.callbacks())
+            .zip(downcalls[2..2 + c_bridge.callbacks().len()].iter())
+            .map(|((registration, callback), create)| {
+                CallbackUpcall::new(registration, callback, create.lib_name().as_str())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(lifecycle) = jvm.callback_handle_lifecycle() {
+            downcalls.push(Downcall::synthetic(Wrapper::lifecycle_clone(lifecycle)?));
+            downcalls.push(Downcall::synthetic(Wrapper::lifecycle_release(lifecycle)?));
+        }
+        for writer in jvm.success_out_writers() {
+            downcalls.push(Downcall::synthetic(Wrapper::success_out_writer(writer)?));
+        }
         let direct_records = c_bridge
             .direct_records()
             .iter()
             .map(|record| record.name().to_owned())
             .collect();
-        let shims = downcalls
+        let mut shims = downcalls
             .iter()
             .map(ShimFunction::for_downcall)
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .flatten()
-            .collect();
+            .collect::<Vec<_>>();
+        shims.extend(
+            callbacks
+                .iter()
+                .flat_map(|upcall| upcall.shims().iter().cloned()),
+        );
+        if !callbacks.is_empty() {
+            let registrations = callbacks
+                .iter()
+                .map(|upcall| format!("    {}(&{});", upcall.register(), upcall.vtable()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            shims.push(ShimFunction::raw(
+                c::Identifier::parse(REGISTER_CALLBACKS)?,
+                format!("void {REGISTER_CALLBACKS}(void) {{\n{registrations}\n}}"),
+            ));
+        }
+        let glue_header_file = glue_path
+            .as_path()
+            .with_extension("h")
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(crate::core::Error::BrokenBridgeContract {
+                bridge: super::NATIVE_IMAGE_BRIDGE,
+                invariant: "glue path has a file name",
+            })?
+            .to_owned();
         let header_file = c_bridge
             .header_path()
             .as_path()
@@ -107,7 +166,35 @@ impl NativeImageContract {
             shims,
             direct_records,
             free_buffer,
+            buffer_from_bytes,
+            callbacks,
+            glue_header_file,
         })
+    }
+
+    /// Returns the `Lib` symbol that copies bytes into an owned buffer through a pointer.
+    pub fn buffer_from_bytes(&self) -> &str {
+        &self.buffer_from_bytes
+    }
+
+    /// Returns Java-implemented callback traits.
+    pub fn callbacks(&self) -> &[CallbackUpcall] {
+        &self.callbacks
+    }
+
+    /// Returns whether any callback vtable must be registered at class init.
+    pub fn registers_callbacks(&self) -> bool {
+        !self.callbacks.is_empty()
+    }
+
+    /// Returns the glue function that registers every callback vtable.
+    pub fn register_callbacks(&self) -> &str {
+        REGISTER_CALLBACKS
+    }
+
+    /// Returns the glue header file name (typedefs shared by Java and the shim).
+    pub fn glue_header_file(&self) -> &str {
+        &self.glue_header_file
     }
 
     /// Returns C typedef names of direct records, each needing a `@CStruct` size probe.

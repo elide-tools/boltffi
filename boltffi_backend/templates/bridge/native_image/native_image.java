@@ -13,6 +13,7 @@ import org.graalvm.nativeimage.c.function.CEntryPointLiteral;
 import org.graalvm.nativeimage.c.function.CFunction;
 import org.graalvm.nativeimage.c.function.CFunctionPointer;
 import org.graalvm.nativeimage.c.function.CLibrary;
+import org.graalvm.nativeimage.c.function.InvokeCFunctionPointer;
 import org.graalvm.nativeimage.c.struct.CField;
 import org.graalvm.nativeimage.c.struct.CStruct;
 import org.graalvm.nativeimage.c.struct.SizeOf;
@@ -30,5 +31,9 @@ final class {{ contract.class_name() }} {
 {%- for wrapper in wrappers %}
 
 {{ wrapper }}
+{%- endfor %}
+{%- for trampoline in trampolines %}
+
+{{ trampoline }}
 {%- endfor %}
 }

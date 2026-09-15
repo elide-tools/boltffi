@@ -111,6 +111,11 @@ impl CallbackMethod {
         self.returns.failure_value()
     }
 
+    /// Returns the grouped JVM arguments in call order.
+    pub fn jvm_arguments(&self) -> &[CallbackArgument] {
+        &self.arguments
+    }
+
     /// Returns the hidden success pointer argument for fallible callback methods.
     pub fn success_out(&self) -> Option<SuccessOutArgument> {
         self.arguments

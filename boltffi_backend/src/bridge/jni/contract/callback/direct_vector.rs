@@ -59,6 +59,11 @@ impl<'argument> CallbackDirectVectorArgument<'argument> {
         self.jni_type.as_array_type_fragment()
     }
 
+    /// Returns the JNI primitive element type.
+    pub fn jni_type(&self) -> JniType {
+        self.jni_type
+    }
+
     /// Returns the JNI array element type.
     pub fn element_type(&self) -> TypeFragment {
         self.jni_type.as_type_fragment()

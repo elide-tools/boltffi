@@ -12,15 +12,26 @@
 use crate::bridge::{
     c::{ArgumentList, Expression, Literal, TypeFragment},
     jni::{
-        CallbackBytesArgument, CallbackClosureArgument, CallbackCompletionArgument,
-        CallbackDirectVectorArgument, CallbackHandleArgument, CallbackRecordArgument,
-        SuccessOutArgument,
+        CallbackBytesArgument, CallbackCParameter, CallbackClosureArgument,
+        CallbackCompletionArgument, CallbackDirectVectorArgument, CallbackHandleArgument,
+        CallbackRecordArgument, JniType, SuccessOutArgument,
     },
 };
 
 use super::{CallbackArgument, CallbackArgumentKind};
 
 impl CallbackArgument {
+    /// Returns the C parameter and JNI type when this argument is a plain scalar value.
+    pub fn value(&self) -> Option<(&CallbackCParameter, JniType)> {
+        match &self.kind {
+            CallbackArgumentKind::Value {
+                parameter,
+                jni_type,
+            } => Some((parameter, *jni_type)),
+            _ => None,
+        }
+    }
+
     /// Returns the fallible success pointer argument when this argument carries one.
     pub fn success_out(&self) -> Option<SuccessOutArgument> {
         match &self.kind {

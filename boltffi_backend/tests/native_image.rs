@@ -66,7 +66,7 @@ fn renders_scalar_functions_without_transition() {
     assert!(out.contains("return Lib.boltffi_function_demo_add(a, b);"));
     assert!(out.contains("static native void boltffi_function_demo_refresh();"));
     assert!(out.contains("@CLibrary(value = \"demo_core\", requireStatic = true)"));
-    assert!(out.contains("Collections.singletonList(\"<demo.h>\")"));
+    assert!(out.contains("java.util.Arrays.asList(\"<demo.h>\", \"<native_image_glue.h>\")"));
     insta::assert_snapshot!(out);
 }
 
@@ -238,7 +238,44 @@ fn dump_fixture() {
         Ok("bytes") => ENCODED_BYTES,
         Ok("errors") => ERRORS,
         Ok("vectors") => DIRECT_VECTORS,
+        Ok("callbacks") => CALLBACKS,
         _ => PRIMITIVE_FUNCTIONS,
     };
     eprintln!("{}", rendered(source));
+}
+
+const CALLBACKS: &str = r#"
+    #[export]
+    pub trait Listener {
+        fn on_value(&self, value: i32) -> i32;
+        fn on_text(&self, text: &str);
+        fn describe(&self) -> String;
+        fn on_batch(&self, values: &[i64]) -> bool;
+    }
+
+    #[export]
+    pub fn subscribe(listener: Box<dyn Listener>) -> i32 { listener.on_value(1) }
+"#;
+
+#[test]
+fn renders_callback_trampolines_and_vtable_registration() {
+    let out = rendered(CALLBACKS);
+    // Java side: entry points with the attach prologue, one per slot plus free and clone
+    assert!(out.contains("CEntryPointOptions(prologue = AttachPrologue.class)"));
+    assert!(out.contains("static int enter(HandleCell cell)"));
+    assert!(out.contains("CEntryPointActions.enterAttachThread(cell.isolate(), true)"));
+    assert!(out.contains("ListenerCallbacks.free(__cell.token());"));
+    assert!(out.contains("ListenerCallbacks.on_value(__cell.token(), value)"));
+    assert!(out.contains("static void ___ListenerVTable_on_text(HandleCell __cell, org.graalvm.word.PointerBase text_ptr, long text_len) {"));
+    assert!(out.contains("static boolean ___ListenerVTable_on_batch(HandleCell __cell, org.graalvm.word.PointerBase values_ptr, long values_len) {"));
+    assert!(out.contains("static FfiBuf_u8 ___ListenerVTable_describe(uint64_t handle) {"));
+    assert!(out.contains("Lib.boltffi_ni_register_callbacks();"));
+    // downcall passes the callback token through a stack BoltFFICallbackHandle
+    assert!(out.contains("static int boltffi_function_demo_subscribe(long listener) {"));
+    assert!(out.contains("CallbackHandle __cb_listener = StackValue.get(CallbackHandle.class);"));
+    // C side: slot shims forward to exported Java entry points, vtable registered once
+    assert!(out.contains("extern void boltffi_ni_java_"));
+    assert!(out.contains("(BoltFFINativeImageHandleCell *)(uintptr_t)handle"));
+    assert!(out.contains("void boltffi_ni_register_callbacks(void) {"));
+    insta::assert_snapshot!(out);
 }

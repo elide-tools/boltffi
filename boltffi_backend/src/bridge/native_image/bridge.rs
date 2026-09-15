@@ -167,10 +167,13 @@ impl bridge::BridgeBackend for NativeImageBridge {
         )?;
         let java = template::render_java(&view)?;
         let glue = template::render_glue(&view)?;
+        let header = template::render_glue_header(&view)?;
+        let header_path = FilePath::new(self.glue_path.as_path().with_extension("h"))?;
         Ok(GeneratedOutput::new(
             vec![
                 GeneratedFile::new(self.java_path.clone(), java),
                 GeneratedFile::new(self.glue_path.clone(), glue),
+                GeneratedFile::new(header_path, header),
             ],
             Vec::new(),
         ))

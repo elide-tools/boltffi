@@ -15,8 +15,9 @@ use crate::{
     bridge::{
         c::{self, Identifier},
         jni::{
-            BytesParameter, DirectVectorParameter, NativeMethod, NativeParameterKind, NativeReturn,
-            RecordParameter, SuccessOutReturn,
+            BytesParameter, CallbackHandleLifecycle, DirectVectorParameter, JniType, NativeMethod,
+            NativeParameterKind, NativeReturn, RecordParameter, SuccessOutReturn, SuccessOutValue,
+            SuccessOutWriter,
         },
     },
     core::{Error, Result},
@@ -128,6 +129,66 @@ impl Wrapper {
         &self.body
     }
 
+    /// Java `Native.<clone>(long handle)` over a Rust-owned callback handle.
+    pub(super) fn lifecycle_clone(lifecycle: &CallbackHandleLifecycle) -> Result<Self> {
+        Ok(Self {
+            name: lifecycle.clone_method().as_str().to_owned(),
+            params: vec![WrapperParameter::new("handle", "long")],
+            returns: "long".to_owned(),
+            body: vec!["return cloneOwnedHandle(handle);".to_owned()],
+        })
+    }
+
+    /// Java `Native.<release>(long handle)` over a Rust-owned callback handle.
+    pub(super) fn lifecycle_release(lifecycle: &CallbackHandleLifecycle) -> Result<Self> {
+        Ok(Self {
+            name: lifecycle.release_method().as_str().to_owned(),
+            params: vec![WrapperParameter::new("handle", "long")],
+            returns: "void".to_owned(),
+            body: vec!["releaseOwnedHandle(handle);".to_owned()],
+        })
+    }
+
+    /// Java `Native.boltffi_success_<kind>(long returnOut, T value)` writing a fallible success value.
+    pub(super) fn success_out_writer(writer: &SuccessOutWriter) -> Result<Self> {
+        let (java_type, body) = match writer.value() {
+            SuccessOutValue::Scalar { jni_type, .. } => {
+                let java = JavaCType::from_jni(*jni_type);
+                let pointer = scalar_pointer_type(java)?;
+                let value = match jni_type {
+                    JniType::Boolean => "(byte) (value ? 1 : 0)".to_owned(),
+                    _ => "value".to_owned(),
+                };
+                (
+                    java.java().to_owned(),
+                    format!("(({pointer}) WordFactory.pointer(returnOut)).write({value});"),
+                )
+            }
+            SuccessOutValue::Bytes => (
+                "byte[]".to_owned(),
+                "writeBuffer((FfiBuf) WordFactory.pointer(returnOut), value);".to_owned(),
+            ),
+            SuccessOutValue::Record { c_type } => (
+                "byte[]".to_owned(),
+                format!(
+                    "writeRecord(WordFactory.pointer(returnOut), value, SizeOf.get({c_type}Struct.class));"
+                ),
+            ),
+        };
+        Ok(Self {
+            name: writer.method().as_str().to_owned(),
+            params: vec![
+                WrapperParameter::new("returnOut", "long"),
+                WrapperParameter::new("value", java_type),
+            ],
+            returns: "void".to_owned(),
+            body: vec![
+                "if (returnOut == 0L) throw new RuntimeException(\"BoltFFI success out pointer was null\");".to_owned(),
+                body,
+            ],
+        })
+    }
+
     /// Returns the comma-separated parameter declarations.
     pub fn declarations(&self) -> String {
         self.params
@@ -149,6 +210,7 @@ pub struct Downcall {
     lib_params: Vec<LibParameter>,
     lib_returns: JavaCType,
     wrapper: Option<Wrapper>,
+    declares_lib: bool,
 }
 
 /// Argument expressions passed to `Lib`, one per C ABI parameter, plus setup and teardown.
@@ -210,14 +272,34 @@ impl Downcall {
             lib_params,
             lib_returns,
             wrapper: None,
+            declares_lib: true,
         })
     }
 
     /// Builds a downcall with a JNI-signature Java wrapper from one native method.
-    pub fn from_native_method(method: &NativeMethod, transition: Transition) -> Result<Self> {
+    pub fn from_native_method(
+        method: &NativeMethod,
+        transition: Transition,
+        callbacks: &[c::Callback],
+    ) -> Result<Self> {
         let mut downcall = Self::from_c_function(method.c_function(), transition)?;
-        downcall.wrapper = Some(WrapperBuilder::new(&downcall, method).build()?);
+        downcall.wrapper = Some(WrapperBuilder::new(&downcall, method, callbacks).build()?);
         Ok(downcall)
+    }
+
+    /// A Java-only wrapper with no `@CFunction` of its own (lifecycle and writer helpers).
+    pub(super) fn synthetic(wrapper: Wrapper) -> Self {
+        Self {
+            lib_name: Identifier::parse("boltffi_ni_synthetic").expect("static identifier"),
+            c_function: c::Function::new("boltffi_ni_synthetic", Vec::new(), c::Type::Void)
+                .expect("static function"),
+            needs_shim: false,
+            transition: Transition::NoTransition,
+            lib_params: Vec::new(),
+            lib_returns: JavaCType::Void,
+            wrapper: Some(wrapper),
+            declares_lib: false,
+        }
     }
 
     fn unsupported(shape: &'static str) -> Error {
@@ -262,6 +344,11 @@ impl Downcall {
         self.lib_returns
     }
 
+    /// Returns whether a `@CFunction` is declared for this downcall.
+    pub const fn declares_lib(&self) -> bool {
+        self.declares_lib
+    }
+
     /// Returns the Java wrapper, when this downcall backs a JNI-contract native method.
     pub fn wrapper(&self) -> Option<&Wrapper> {
         self.wrapper.as_ref()
@@ -281,22 +368,27 @@ impl Downcall {
 struct WrapperBuilder<'a> {
     downcall: &'a Downcall,
     method: &'a NativeMethod,
+    callbacks: &'a [c::Callback],
 }
 
 impl<'a> WrapperBuilder<'a> {
-    fn new(downcall: &'a Downcall, method: &'a NativeMethod) -> Self {
-        Self { downcall, method }
+    fn new(downcall: &'a Downcall, method: &'a NativeMethod, callbacks: &'a [c::Callback]) -> Self {
+        Self {
+            downcall,
+            method,
+            callbacks,
+        }
     }
 
     fn build(self) -> Result<Wrapper> {
         let method = self.method;
         let mut params = Vec::new();
         let mut marshalled = Marshalled::default();
-        let mut groups = method.c_function().parameter_groups().iter();
+        let groups = method.c_function().parameter_groups().iter();
         let mut parameters = method.parameters().iter();
         let mut success_out: Option<&SuccessOutReturn> = None;
         let mut writeback_buffer: Option<String> = None;
-        while let Some(group) = groups.next() {
+        for group in groups {
             match group {
                 c::ParameterGroup::SuccessOut(_) => {
                     let out = method.success_out().ok_or(Error::BrokenBridgeContract {
@@ -343,8 +435,40 @@ impl<'a> WrapperBuilder<'a> {
                         NativeParameterKind::Record(record) => {
                             Self::record(record, group, &mut params, &mut marshalled);
                         }
-                        NativeParameterKind::Callback(_) => {
-                            return Err(Downcall::unsupported("callback parameter"));
+                        NativeParameterKind::Callback(callback) => {
+                            let c::ParameterGroup::Value(index) = group else {
+                                return Err(Error::BrokenBridgeContract {
+                                    bridge: NATIVE_IMAGE_BRIDGE,
+                                    invariant: "callback parameter is a single C value",
+                                });
+                            };
+                            let c::Type::CallbackHandle(id) =
+                                method.c_function().parameter(*index).ty()
+                            else {
+                                return Err(Error::BrokenBridgeContract {
+                                    bridge: NATIVE_IMAGE_BRIDGE,
+                                    invariant: "callback parameter has a callback handle type",
+                                });
+                            };
+                            let stem = self
+                                .callbacks
+                                .iter()
+                                .find(|declaration| declaration.id() == *id)
+                                .map(|declaration| declaration.vtable().name().to_owned())
+                                .ok_or(Error::BrokenBridgeContract {
+                                    bridge: NATIVE_IMAGE_BRIDGE,
+                                    invariant: "callback parameter names a declared callback",
+                                })?;
+                            let token = WrapperParameter::new(callback.name().as_str(), "long");
+                            let local = format!("__cb_{}", token.name);
+                            marshalled.setup.push(format!(
+                                "CallbackHandle {local} = StackValue.get(CallbackHandle.class);"
+                            ));
+                            marshalled
+                                .setup
+                                .push(format!("{stem}_parameter({}, {local});", token.name));
+                            marshalled.arguments.push(local);
+                            params.push(token);
                         }
                         NativeParameterKind::Closure(_) => {
                             return Err(Downcall::unsupported("closure parameter"));
@@ -524,9 +648,7 @@ impl<'a> WrapperBuilder<'a> {
             NativeReturn::Status | NativeReturn::EncodedError => "void".to_owned(),
             NativeReturn::StatusValue(out) => Self::success_java_type(out)?,
             NativeReturn::EncodedErrorValue(out) => Self::success_java_type(out.success())?,
-            NativeReturn::Callback(_) => {
-                return Err(Downcall::unsupported("callback handle return"));
-            }
+            NativeReturn::Callback(_) => "long".to_owned(),
         };
         let needs_result_local = marshalled.pins > 0 && result_type != "void";
         let finish = |body: &mut Vec<String>, tail: &mut Vec<String>, value: String| {
@@ -597,7 +719,19 @@ impl<'a> WrapperBuilder<'a> {
                 body.push("checkErrorBuffer(__error);".to_owned());
                 finish(&mut body, &mut tail, Self::success_value(out.success())?);
             }
-            NativeReturn::Callback(_) => unreachable!("rejected above"),
+            NativeReturn::Callback(_) => {
+                marshalled.arguments.push("__result_handle".to_owned());
+                body.push(
+                    "CallbackHandle __result_handle = StackValue.get(CallbackHandle.class);"
+                        .to_owned(),
+                );
+                body.push(format!("{};", self.call(marshalled)));
+                finish(
+                    &mut body,
+                    &mut tail,
+                    "storeOwnedHandle(__result_handle)".to_owned(),
+                );
+            }
         }
         let _ = success_out;
         if needs_result_local {
