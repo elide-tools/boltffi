@@ -10,6 +10,22 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-14-native-image-c-api-design.md`
 
+## Status (2026-09-14)
+
+- Task 1 done (`14e79fc3`), Task 2 done (`eaa84689`), Task 3 done (`70e9c756`),
+  Task 4a done (`975962aa`): Java-implemented callbacks with sync methods,
+  free/clone, callback parameters, Rust-owned handle returns, lifecycle and
+  success-out writer wrappers.
+- Task 3 needed no host `Transport` change: the spike proved
+  `MemorySegment.ofBuffer(buffer).address()` works in Native Image, so the
+  host's existing direct-buffer transport is kept and `directAddress()` reads it.
+- Design change from the plan: the glue owns the vtables and registers them
+  through `boltffi_ni_register_callbacks()`; slots are C shims that forward to
+  exported `@CEntryPoint`s (`boltffi_ni_java_*`). This pointerizes struct
+  slot arguments the same way downcall shims do.
+- Remaining: 4b handle methods, 4c closures, 4d async (continuations,
+  completions), 4e streams, 5 packaging, 6 runtime test, 7 docs.
+
 ## Global Constraints
 
 - Native Image only. Generated Java must not be expected to run on HotSpot.
