@@ -239,6 +239,7 @@ fn dump_fixture() {
         Ok("errors") => ERRORS,
         Ok("vectors") => DIRECT_VECTORS,
         Ok("callbacks") => CALLBACKS,
+        Ok("handles") => CALLBACK_HANDLES,
         _ => PRIMITIVE_FUNCTIONS,
     };
     eprintln!("{}", rendered(source));
@@ -277,5 +278,46 @@ fn renders_callback_trampolines_and_vtable_registration() {
     assert!(out.contains("extern void boltffi_ni_java_"));
     assert!(out.contains("(BoltFFINativeImageHandleCell *)(uintptr_t)handle"));
     assert!(out.contains("void boltffi_ni_register_callbacks(void) {"));
+    insta::assert_snapshot!(out);
+}
+
+const CALLBACK_HANDLES: &str = r#"
+    #[export]
+    pub trait Child {
+        fn value(&self) -> i32;
+        fn greet(&self, name: String) -> String;
+    }
+
+    #[export]
+    pub trait Parent {
+        fn on_child(&self, child: Box<dyn Child>);
+    }
+
+    #[export]
+    pub fn make_child() -> Box<dyn Child> { loop {} }
+
+    #[export]
+    pub fn watch(parent: Box<dyn Parent>) { let _ = parent; }
+"#;
+
+#[test]
+fn renders_rust_owned_callback_handle_methods() {
+    let out = rendered(CALLBACK_HANDLES);
+    // Java wrappers keep the JNI signature and dispatch through the glue invoker.
+    assert!(out.contains("static int boltffi_callback_handle_demo_child_value(long handle) {"));
+    assert!(out.contains("CallbackHandle __callback = ownedHandle(handle);"));
+    assert!(out.contains("return Lib.boltffi_ni_invoke____ChildVTable_value(__callback);"));
+    assert!(out.contains("static byte[] boltffi_callback_handle_demo_child_greet(long handle, java.nio.ByteBuffer name, int __boltffi_name_len) {"));
+    assert!(out.contains("Lib.boltffi_ni_invoke____ChildVTable_greet(__callback, __boltffi_name_ptr, (long) __boltffi_name_len, __result_buffer);"));
+    assert!(out.contains("static native int boltffi_ni_invoke____ChildVTable_value(org.graalvm.word.PointerBase __callback);"));
+    // the glue invoker casts the stored vtable and calls the slot with the handle value
+    assert!(out.contains("int32_t boltffi_ni_invoke____ChildVTable_value(const BoltFFICallbackHandle *__callback) {\n    const ___ChildVTable *__vtable = (const ___ChildVTable *)__callback->vtable;\n    return __vtable->value(__callback->handle);\n}"));
+    assert!(out.contains("*__out = __vtable->greet(__callback->handle, name_ptr, name_len);"));
+    // a callback handle handed to a Java-implemented callback becomes an owned token
+    assert!(out.contains("static void ___ParentVTable_on_child(HandleCell __cell, org.graalvm.word.PointerBase child) {"));
+    assert!(
+        out.contains("long __boltffi_child_handle = storeOwnedHandle((CallbackHandle) child);")
+    );
+    assert!(out.contains("ParentCallbacks.on_child(__cell.token(), __boltffi_child_handle);"));
     insta::assert_snapshot!(out);
 }

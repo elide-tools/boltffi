@@ -95,6 +95,15 @@ impl NativeImageContract {
                 CallbackUpcall::new(registration, callback, create.lib_name().as_str())
             })
             .collect::<Result<Vec<_>>>()?;
+        for registration in jvm.callbacks() {
+            for method in registration.handle_methods() {
+                downcalls.push(Downcall::from_handle_method(
+                    method,
+                    transition,
+                    c_bridge.callbacks(),
+                )?);
+            }
+        }
         if let Some(lifecycle) = jvm.callback_handle_lifecycle() {
             downcalls.push(Downcall::synthetic(Wrapper::lifecycle_clone(lifecycle)?));
             downcalls.push(Downcall::synthetic(Wrapper::lifecycle_release(lifecycle)?));
@@ -109,7 +118,10 @@ impl NativeImageContract {
             .collect();
         let mut shims = downcalls
             .iter()
-            .map(ShimFunction::for_downcall)
+            .map(|downcall| match downcall.extra_shim() {
+                Some(shim) => Ok(Some(shim.clone())),
+                None => ShimFunction::for_downcall(downcall),
+            })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .flatten()

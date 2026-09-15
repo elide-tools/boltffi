@@ -116,6 +116,15 @@ final class BoltFFINativeImage {
         return stored.rawValue();
     }
 
+    /** Resolves a Rust-owned callback handle token into the stored `BoltFFICallbackHandle`. */
+    static CallbackHandle ownedHandle(long token) {
+        CallbackHandle stored = WordFactory.pointer(token);
+        if (stored.isNull() || stored.handle() == 0L || stored.vtable().isNull()) {
+            throw new RuntimeException("BoltFFI callback handle was null or invalid");
+        }
+        return stored;
+    }
+
     static long cloneOwnedHandle(long token) {
         CallbackHandle stored = WordFactory.pointer(token);
         if (stored.isNull() || stored.handle() == 0L || stored.vtable().isNull()) {

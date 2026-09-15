@@ -260,8 +260,14 @@ impl CallbackUpcall {
                     record.parameter().as_str()
                 ));
                 arguments.push(record.array().as_str().to_owned());
-            } else if argument.callback_handle().is_some() {
-                return Err(unsupported("callback handle argument in callback method"));
+            } else if let Some(handle) = argument.callback_handle() {
+                // The slot receives the handle by value; the shim passes its address.
+                setup.push(format!(
+                    "long {} = storeOwnedHandle((CallbackHandle) {});",
+                    handle.handle().as_str(),
+                    handle.parameter().as_str()
+                ));
+                arguments.push(handle.handle().as_str().to_owned());
             } else if argument.closure_handle().is_some() {
                 return Err(unsupported("closure argument in callback method"));
             } else if argument.completion().is_some() {
