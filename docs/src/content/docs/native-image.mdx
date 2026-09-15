@@ -45,34 +45,26 @@ The default `binding` is `"jni"`. Only one binding per Java target is allowed. W
 When you run `boltffi pack java` with the Native Image backend enabled, BoltFFI:
 
 1. **Builds the Rust crate** as a `staticlib` static archive
-2. **Generates Java sources** including a package-private `Native` class with C API declarations
-3. **Compiles the C shim layer** (`native_image_glue.c`) into a second static archive to bridge by-value structs that the C API cannot express directly
-4. **Stages the artifacts** under `dist/java/native/`:
-   - The Rust static library (`lib<name>.a`)
-   - The C shim static library
-   - Generated C headers (`boltffi.h` and `native_image_glue.h`)
-   - Generated Java sources
+2. **Generates Java sources**, including a package-private `BoltFFINativeImage` class that holds the `@CFunction` declarations, the header directives, and the callback entry points
+3. **Compiles the C shim** (`native_image_glue.c`), which bridges the by-value structs the C API cannot express, and appends it to the Rust static archive
+4. **Stages the artifacts** under `dist/java/native/`: the combined static library, `boltffi.h`, and `native_image_glue.h`
 
 ### Output Structure
 
 ```
 dist/java/
 ├── com/example/mylib/
-│   ├── MyLib.java          # Functions module (API unchanged from JNI)
-│   ├── Native.java         # C API declarations (package-private)
-│   ├── Directives.java     # Header and include path directives
-│   ├── Lib.java            # @CFunction declarations
-│   ├── Demo.java           # Your exported class (unchanged)
-│   └── ... (records, enums, callbacks, etc.)
+│   ├── MyLib.java               # Public API, identical to the JNI target
+│   ├── BoltFFINativeImage.java  # @CFunction declarations, directives, entry points
+│   └── ...                      # records, enums, callbacks, errors
 ├── META-INF/
 │   └── native-image/
 │       └── com/example/mylib/
-│           └── native-image.properties  # Native Image configuration
+│           └── native-image.properties
 └── native/
-    ├── libyourlib.a                 # Rust staticlib
-    ├── libyourlib_ni.a              # C shim staticlib
-    ├── boltffi.h                    # Main C header
-    └── native_image_glue.h          # C shim header
+    ├── libmylib.a               # Rust staticlib with the C shim appended
+    ├── boltffi.h                # Generated C header
+    └── native_image_glue.h      # Shim typedefs shared with the Java side
 ```
 
 ## The native-image.properties File
