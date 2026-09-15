@@ -152,6 +152,15 @@
         return stored.rawValue();
     }
 
+    /** Resolves a Rust-owned callback handle token into the stored `BoltFFICallbackHandle`. */
+    static CallbackHandle ownedHandle(long token) {
+        CallbackHandle stored = WordFactory.pointer(token);
+        if (stored.isNull() || stored.handle() == 0L || stored.vtable().isNull()) {
+            throw new RuntimeException("BoltFFI callback handle was null or invalid");
+        }
+        return stored;
+    }
+
     static long cloneOwnedHandle(long token) {
         CallbackHandle stored = WordFactory.pointer(token);
         if (stored.isNull() || stored.handle() == 0L || stored.vtable().isNull()) {
@@ -196,6 +205,11 @@
         out.vtable(stored.vtable());
     }
 {%- endfor %}
+
+    static void zeroCallbackHandle(CallbackHandle handle) {
+        handle.handle(0L);
+        handle.vtable(WordFactory.nullPointer());
+    }
 
     static void zeroBuffer(FfiBuf buffer) {
         buffer.ptr(WordFactory.nullPointer());
@@ -299,8 +313,25 @@
         return (int) length;
     }
 
+    /** Returns the byte length of a stream batch buffer holding `maxCount` items. */
+    static int checkedBatchBytes(long maxCount, int itemSize) {
+        if (maxCount < 0) {
+            throw new IllegalArgumentException("BoltFFI stream batch size was negative");
+        }
+        if (maxCount > Integer.MAX_VALUE / itemSize) {
+            throw new RuntimeException("BoltFFI stream batch allocation is too large");
+        }
+        return (int) maxCount * itemSize;
+    }
+
     static byte[] copyRecord(PointerBase pointer, int size) {
         return copyBytes(pointer, size);
+    }
+
+    static void checkRecordLength(byte[] value, int size) {
+        if (value == null || value.length != size) {
+            throw new IllegalArgumentException("BoltFFI record byte array length did not match the C record size");
+        }
     }
 
     static void writeRecord(PointerBase pointer, byte[] value, int size) {

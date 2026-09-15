@@ -33,6 +33,11 @@ impl ClosureScalarArgument {
         })
     }
 
+    /// Returns the single C parameter carrying this scalar.
+    pub fn parameter(&self) -> &ClosureCParameter {
+        &self.parameter
+    }
+
     /// Returns the C parameters accepted by the closure call trampoline.
     pub fn c_parameters(&self) -> Vec<ClosureCParameter> {
         vec![self.parameter.clone()]

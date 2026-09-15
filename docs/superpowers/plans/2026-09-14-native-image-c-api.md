@@ -23,21 +23,26 @@
   through `boltffi_ni_register_callbacks()`; slots are C shims that forward to
   exported `@CEntryPoint`s (`boltffi_ni_java_*`). This pointerizes struct
   slot arguments the same way downcall shims do.
-- Task 6 done for the shapes implemented so far:
-  `boltffi_backend/tests/native_image_runtime.rs` builds a scratch `staticlib`
-  fixture, renders the Native Image bindings, compiles the glue into the
-  archive, links a real image and runs it. It covers scalar round trips, a
-  direct record, a string, `Result<i32, E>` and `Result<String, E>` both ways,
-  a `&[i32]` sum, and a sync callback invoked on the calling thread and from a
-  `std::thread::spawn` inside Rust. The test skips when `native-image` is not
-  discoverable. Two generator defects it found are fixed in `66a53b9c`:
-  vtable registration must not run from a build-time static initializer, and
-  upcalls returning anything but `void`/`int` need an explicit
-  `prologueBailout`. `javac --release 25` cannot see the GraalVM modules
-  (`ct.sym`), so the test pins `-source`/`-target` instead.
-- Remaining: 4b handle methods, 4c closures, 4d async (continuations,
-  completions), 4e streams, 5 packaging, 7 docs. Task 6 grows async and
-  stream cases once 4d and 4e land.
+- Task 4b done (`84b8b10c`): Rust-owned callback handle methods dispatch
+  through a `boltffi_ni_invoke_<vtable>_<slot>` glue invoker that casts the
+  stored vtable; callback-handle arguments inside Java-implemented callback
+  methods copy the incoming handle with `storeOwnedHandle`.
+- Task 4c done in part (`2216e3c4`): JVM-owned closures get a call and a
+  release `@CEntryPoint` per signature, a `HandleCell` context, static glue
+  forwarders, and two `void *` glue accessors the downcall wrapper reads to
+  build the `(call, context, release)` triple.
+- Task 4d done (`b881344e`): one shared poll continuation entry point behind a
+  one-shot `HandleCell`, `CompletionStatusOut` as stack `CIntPointer` storage,
+  and async callback methods completing through pointer-ABI completion shims.
+- Task 4e done (`24b74688`): stream protocol methods render from
+  `jvm.streams()`, and the direct batch pins a Java byte array across the call.
+- Still unsupported, each failing at generation time: Rust-owned closure
+  handles (closure arguments in callback methods, `ClosureReturn` groups, and
+  the `ClosureRegistration` handle helpers), callback-handle completion
+  payloads, async callback handle methods, and closures returning callback
+  handles.
+- Remaining: the closure-handle shapes above, 5 packaging, 6 runtime test,
+  7 docs.
 
 ## Global Constraints
 

@@ -44,6 +44,11 @@ impl ClosureParameter {
         self.release
     }
 
+    /// Returns the C ABI parameters the closure call function accepts after its context.
+    pub fn parameters(&self) -> &[Parameter] {
+        &self.parameters
+    }
+
     /// Returns the C ABI parameter at the given closure-call position.
     pub fn parameter(&self, index: ParameterIndex) -> &Parameter {
         &self.parameters[index.position()]

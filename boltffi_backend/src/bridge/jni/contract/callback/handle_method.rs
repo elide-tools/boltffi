@@ -41,6 +41,7 @@ const JNI_BRIDGE: &str = "jni";
 pub struct CallbackHandleMethod {
     symbol: JniSymbolName,
     method: Identifier,
+    function: c::Function,
     vtable_type: Identifier,
     slot: Identifier,
     call: CallbackHandleMethodCall,
@@ -109,6 +110,11 @@ impl CallbackHandleMethod {
     /// Returns the JVM native method name.
     pub fn method(&self) -> &Identifier {
         &self.method
+    }
+
+    /// Returns the C function shape of the JVM-visible parameters after the handle.
+    pub fn c_function(&self) -> &c::Function {
+        &self.function
     }
 
     /// Returns the C callback vtable type.
@@ -263,6 +269,7 @@ impl CallbackHandleMethod {
             slot: slot.name().clone(),
             call,
             parameters: NativeParameter::from_c_function(&function, callbacks, closures)?,
+            function,
         })
     }
 

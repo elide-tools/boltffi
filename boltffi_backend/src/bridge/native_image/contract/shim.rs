@@ -97,13 +97,9 @@ impl Pointerized {
     }
 }
 
-/// Spells a C parameter declaration without a stray space before the name.
+/// Spells a C parameter declaration, wrapping function pointers around the name.
 pub(super) fn c_declaration(ty: &c::Type, name: &str) -> Result<String> {
-    let ty = TypeFragment::anonymous(ty)?.to_string();
-    Ok(match ty.ends_with('*') {
-        true => format!("{ty}{name}"),
-        false => format!("{ty} {name}"),
-    })
+    Ok(TypeFragment::declaration(ty, name)?.to_string())
 }
 
 /// One shim function definition in the generated glue file.
@@ -153,6 +149,53 @@ impl ShimFunction {
             name: downcall.lib_name().clone(),
             source,
         }))
+    }
+
+    /// Builds the glue shim that dispatches one Rust-owned callback handle slot.
+    ///
+    /// Java cannot follow a C function pointer out of a struct it only sees as a
+    /// word, so the glue casts the stored vtable and calls the slot with the
+    /// handle's own value, taking every by-value struct through a pointer.
+    pub(super) fn for_handle_method(
+        name: &str,
+        vtable_type: &str,
+        slot: &str,
+        function: &c::Function,
+        pointerized: &Pointerized,
+    ) -> Result<Self> {
+        let arguments = std::iter::once("__callback->handle".to_owned())
+            .chain(function.params().iter().map(|parameter| {
+                match JavaCType::is_by_value_struct(parameter.ty()) {
+                    true => format!("*{}", parameter.name()),
+                    false => parameter.name().to_owned(),
+                }
+            }))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let call = format!("__vtable->{slot}({arguments})");
+        let body = if pointerized.status_return {
+            format!("return {call}.code;")
+        } else if pointerized.out_param {
+            format!("*__out = {call};")
+        } else if pointerized.returns.is_void() {
+            format!("{call};")
+        } else {
+            format!("return {call};")
+        };
+        let declarations = std::iter::once("const BoltFFICallbackHandle *__callback".to_owned())
+            .chain(
+                std::iter::once(pointerized.c_declarations()?).filter(|params| !params.is_empty()),
+            )
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source = format!(
+            "{returns} {name}({declarations}) {{\n    const {vtable_type} *__vtable = (const {vtable_type} *)__callback->vtable;\n    {body}\n}}",
+            returns = pointerized.c_return()?,
+        );
+        Ok(Self {
+            name: Identifier::parse(name)?,
+            source,
+        })
     }
 
     /// Creates a shim from an already-rendered definition.

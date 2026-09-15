@@ -15,15 +15,19 @@ use crate::{
     bridge::{
         c::{self, Identifier},
         jni::{
-            BytesParameter, CallbackHandleLifecycle, DirectVectorParameter, JniType, NativeMethod,
-            NativeParameterKind, NativeReturn, RecordParameter, SuccessOutReturn, SuccessOutValue,
-            SuccessOutWriter,
+            BytesParameter, CallbackHandleLifecycle, CallbackHandleMethod,
+            ClosureParameter as JniClosureParameter, DirectStreamBatchMethod,
+            DirectVectorParameter, JniType, NativeMethod, NativeParameter, NativeParameterKind,
+            NativeReturn, RecordParameter, SuccessOutReturn, SuccessOutValue, SuccessOutWriter,
         },
     },
     core::{Error, Result},
 };
 
-use super::{super::NATIVE_IMAGE_BRIDGE, JavaCType};
+use super::{
+    super::NATIVE_IMAGE_BRIDGE, ClosureUpcall, JavaCType, ShimFunction,
+    asynchronous::CONTINUATION_ADDRESS, shim::Pointerized,
+};
 
 /// Thread state transition performed around a `@CFunction` call.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -75,6 +79,11 @@ pub struct WrapperParameter {
 }
 
 impl WrapperParameter {
+    /// Creates a Java parameter with an already-safe name.
+    pub(super) fn named(name: &str, java_type: impl Into<String>) -> Self {
+        Self::new(name, java_type)
+    }
+
     fn new(name: &str, java_type: impl Into<String>) -> Self {
         Self {
             name: java_identifier(name),
@@ -109,6 +118,21 @@ pub struct Wrapper {
 }
 
 impl Wrapper {
+    /// Creates a wrapper from already-rendered Java pieces.
+    pub(super) fn raw(
+        name: String,
+        params: Vec<WrapperParameter>,
+        returns: String,
+        body: Vec<String>,
+    ) -> Self {
+        Self {
+            name,
+            params,
+            returns,
+            body,
+        }
+    }
+
     /// Returns the Java method name (equal to the C export name).
     pub fn name(&self) -> &str {
         &self.name
@@ -211,6 +235,7 @@ pub struct Downcall {
     lib_returns: JavaCType,
     wrapper: Option<Wrapper>,
     declares_lib: bool,
+    extra_shim: Option<ShimFunction>,
 }
 
 /// Argument expressions passed to `Lib`, one per C ABI parameter, plus setup and teardown.
@@ -273,6 +298,7 @@ impl Downcall {
             lib_returns,
             wrapper: None,
             declares_lib: true,
+            extra_shim: None,
         })
     }
 
@@ -281,10 +307,179 @@ impl Downcall {
         method: &NativeMethod,
         transition: Transition,
         callbacks: &[c::Callback],
+        closures: &[ClosureUpcall],
     ) -> Result<Self> {
         let mut downcall = Self::from_c_function(method.c_function(), transition)?;
-        downcall.wrapper = Some(WrapperBuilder::new(&downcall, method, callbacks).build()?);
+        let wrapper = WrapperBuilder {
+            downcall: &downcall,
+            name: method.c_function().name().to_owned(),
+            c_function: method.c_function(),
+            parameters: method.parameters(),
+            returns: method.returns(),
+            success_out: method.success_out(),
+            receiver: false,
+            callbacks,
+            closures,
+        }
+        .build()?;
+        downcall.wrapper = Some(wrapper);
         Ok(downcall)
+    }
+
+    /// Builds the wrapper and glue shim for one Rust-owned callback handle method.
+    ///
+    /// The Java wrapper takes the handle token first and calls a glue shim that
+    /// dispatches through the stored vtable slot with the handle's own value.
+    pub fn from_handle_method(
+        method: &CallbackHandleMethod,
+        transition: Transition,
+        callbacks: &[c::Callback],
+        closures: &[ClosureUpcall],
+    ) -> Result<Self> {
+        if method.completion().is_some() {
+            return Err(Self::unsupported("asynchronous callback handle method"));
+        }
+        if method.returns_closure() {
+            return Err(Self::unsupported(
+                "callback handle method returning a closure",
+            ));
+        }
+        let returns = method
+            .synchronous_return()
+            .ok_or(Error::BrokenBridgeContract {
+                bridge: NATIVE_IMAGE_BRIDGE,
+                invariant: "synchronous callback handle method has a return contract",
+            })?;
+        let function = method.c_function();
+        let lib_name = Identifier::parse(format!(
+            "boltffi_ni_invoke_{}_{}",
+            method.vtable_type().as_str(),
+            method.slot().as_str()
+        ))?;
+        let pointerized = Pointerized::new(function.params(), function.returns())?;
+        let lib_params = std::iter::once(Ok(LibParameter {
+            name: Identifier::parse("__callback")?,
+            ty: JavaCType::Pointer,
+            c_type: c::Type::ConstPointer(Box::new(c::Type::Void)),
+        }))
+        .chain(pointerized.params.iter().map(|(name, ty, java)| {
+            Ok(LibParameter {
+                name: name.clone(),
+                ty: *java,
+                c_type: ty.clone(),
+            })
+        }))
+        .collect::<Result<Vec<_>>>()?;
+        let shim = ShimFunction::for_handle_method(
+            lib_name.as_str(),
+            method.vtable_type().as_str(),
+            method.slot().as_str(),
+            function,
+            &pointerized,
+        )?;
+        let mut downcall = Self {
+            lib_name,
+            c_function: function.clone(),
+            needs_shim: false,
+            transition,
+            lib_params,
+            lib_returns: pointerized.returns,
+            wrapper: None,
+            declares_lib: true,
+            extra_shim: Some(shim),
+        };
+        let wrapper = WrapperBuilder {
+            downcall: &downcall,
+            name: method.method().as_str().to_owned(),
+            c_function: function,
+            parameters: method.parameters(),
+            returns,
+            success_out: method.success_out(),
+            receiver: true,
+            callbacks,
+            closures,
+        }
+        .build()?;
+        downcall.wrapper = Some(wrapper);
+        Ok(downcall)
+    }
+
+    /// Builds the wrapper for a direct stream batch, which fills a Java array in place.
+    ///
+    /// The C bridge writes items into caller-owned storage and returns how many
+    /// it wrote, so the wrapper pins a byte array large enough for the requested
+    /// count and trims it to the used prefix.
+    pub(super) fn direct_batch(
+        batch: &DirectStreamBatchMethod,
+        transition: Transition,
+    ) -> Result<Self> {
+        let mut downcall = Self::from_c_function(batch.c_function(), transition)?;
+        let subscription = match downcall.lib_params.first().map(LibParameter::ty) {
+            Some(JavaCType::Pointer) => "WordFactory.pointer(subscription)".to_owned(),
+            _ => "subscription".to_owned(),
+        };
+        let lib = downcall.lib_name.as_str().to_owned();
+        let size = batch.item_size();
+        downcall.wrapper = Some(Wrapper {
+            name: batch.c_function().name().to_owned(),
+            params: vec![
+                WrapperParameter::new("subscription", "long"),
+                WrapperParameter::new("maxCount", "long"),
+            ],
+            returns: "byte[]".to_owned(),
+            body: vec![
+                format!("byte[] __items = new byte[checkedBatchBytes(maxCount, {size})];"),
+                "long __count;".to_owned(),
+                "if (__items.length == 0) {".to_owned(),
+                format!(
+                    "    __count = Lib.{lib}({subscription}, WordFactory.nullPointer(), maxCount);"
+                ),
+                "} else {".to_owned(),
+                "    try (PinnedObject __pin_items = PinnedObject.create(__items)) {".to_owned(),
+                format!(
+                    "        __count = Lib.{lib}({subscription}, __pin_items.addressOfArrayElement(0), maxCount);"
+                ),
+                "    }".to_owned(),
+                "}".to_owned(),
+                "if (__count > maxCount) {".to_owned(),
+                "    throw new RuntimeException(\"BoltFFI stream returned more items than requested\");"
+                    .to_owned(),
+                "}".to_owned(),
+                format!("return java.util.Arrays.copyOf(__items, (int) (__count * {size}L));"),
+            ],
+        });
+        Ok(downcall)
+    }
+
+    /// A `@CFunction` declaration with explicit parameters and a Java wrapper.
+    pub(super) fn glue(
+        lib_name: &str,
+        lib_params: &[(String, JavaCType)],
+        lib_returns: JavaCType,
+        transition: Transition,
+        wrapper: Option<Wrapper>,
+        extra_shim: Option<ShimFunction>,
+    ) -> Result<Self> {
+        Ok(Self {
+            lib_name: Identifier::parse(lib_name)?,
+            c_function: c::Function::new(lib_name, Vec::new(), c::Type::Void)?,
+            needs_shim: false,
+            transition,
+            lib_params: lib_params
+                .iter()
+                .map(|(name, ty)| {
+                    Ok(LibParameter {
+                        name: Identifier::parse(name)?,
+                        ty: *ty,
+                        c_type: c::Type::Void,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            lib_returns,
+            wrapper,
+            declares_lib: true,
+            extra_shim,
+        })
     }
 
     /// A Java-only wrapper with no `@CFunction` of its own (lifecycle and writer helpers).
@@ -299,7 +494,13 @@ impl Downcall {
             lib_returns: JavaCType::Void,
             wrapper: Some(wrapper),
             declares_lib: false,
+            extra_shim: None,
         }
+    }
+
+    /// Returns a hand-written glue shim replacing the automatic pointer-ABI one.
+    pub fn extra_shim(&self) -> Option<&ShimFunction> {
+        self.extra_shim.as_ref()
     }
 
     fn unsupported(shape: &'static str) -> Error {
@@ -364,34 +565,42 @@ impl Downcall {
     }
 }
 
-/// Builds the wrapper body for one native method.
+/// Builds the wrapper body for one native method or callback handle method.
 struct WrapperBuilder<'a> {
     downcall: &'a Downcall,
-    method: &'a NativeMethod,
+    /// Java method name (the JNI `Native` member this wrapper replaces).
+    name: String,
+    /// C shape of the parameters the Java wrapper marshals.
+    c_function: &'a c::Function,
+    parameters: &'a [NativeParameter],
+    returns: &'a NativeReturn,
+    success_out: Option<&'a SuccessOutReturn>,
+    /// Whether a leading `long handle` names a Rust-owned callback to dispatch through.
+    receiver: bool,
     callbacks: &'a [c::Callback],
+    closures: &'a [ClosureUpcall],
 }
 
-impl<'a> WrapperBuilder<'a> {
-    fn new(downcall: &'a Downcall, method: &'a NativeMethod, callbacks: &'a [c::Callback]) -> Self {
-        Self {
-            downcall,
-            method,
-            callbacks,
-        }
-    }
-
+impl WrapperBuilder<'_> {
     fn build(self) -> Result<Wrapper> {
-        let method = self.method;
         let mut params = Vec::new();
         let mut marshalled = Marshalled::default();
-        let groups = method.c_function().parameter_groups().iter();
-        let mut parameters = method.parameters().iter();
+        if self.receiver {
+            params.push(WrapperParameter::new("handle", "long"));
+            marshalled
+                .setup
+                .push("CallbackHandle __callback = ownedHandle(handle);".to_owned());
+            marshalled.arguments.push("__callback".to_owned());
+        }
+        let groups = self.c_function.parameter_groups().iter();
+        let mut parameters = self.parameters.iter();
         let mut success_out: Option<&SuccessOutReturn> = None;
         let mut writeback_buffer: Option<String> = None;
+        let mut completion_status = false;
         for group in groups {
             match group {
                 c::ParameterGroup::SuccessOut(_) => {
-                    let out = method.success_out().ok_or(Error::BrokenBridgeContract {
+                    let out = self.success_out.ok_or(Error::BrokenBridgeContract {
                         bridge: NATIVE_IMAGE_BRIDGE,
                         invariant: "success out-pointer has a matching JNI return value",
                     })?;
@@ -399,7 +608,15 @@ impl<'a> WrapperBuilder<'a> {
                     Self::success_out_storage(out, &mut marshalled)?;
                 }
                 c::ParameterGroup::CompletionStatusOut(_) => {
-                    return Err(Downcall::unsupported("async completion status"));
+                    marshalled.setup.push(
+                        "org.graalvm.nativeimage.c.type.CIntPointer __boltffi_status = StackValue.get(org.graalvm.nativeimage.c.type.CIntPointer.class);"
+                            .to_owned(),
+                    );
+                    marshalled
+                        .setup
+                        .push("__boltffi_status.write(0);".to_owned());
+                    marshalled.arguments.push("__boltffi_status".to_owned());
+                    completion_status = true;
                 }
                 c::ParameterGroup::CallbackCompletion(_) | c::ParameterGroup::ClosureReturn(_) => {
                     return Err(Error::BrokenBridgeContract {
@@ -443,7 +660,7 @@ impl<'a> WrapperBuilder<'a> {
                                 });
                             };
                             let c::Type::CallbackHandle(id) =
-                                method.c_function().parameter(*index).ty()
+                                self.c_function.parameter(*index).ty()
                             else {
                                 return Err(Error::BrokenBridgeContract {
                                     bridge: NATIVE_IMAGE_BRIDGE,
@@ -470,18 +687,29 @@ impl<'a> WrapperBuilder<'a> {
                             marshalled.arguments.push(local);
                             params.push(token);
                         }
-                        NativeParameterKind::Closure(_) => {
-                            return Err(Downcall::unsupported("closure parameter"));
+                        NativeParameterKind::Closure(closure) => {
+                            self.closure(closure, &mut params, &mut marshalled)?;
                         }
-                        NativeParameterKind::Continuation(_) => {
-                            return Err(Downcall::unsupported("async continuation parameter"));
+                        NativeParameterKind::Continuation(continuation) => {
+                            let token = WrapperParameter::new(continuation.name().as_str(), "long");
+                            marshalled
+                                .arguments
+                                .push(format!("newHandleCell({})", token.name));
+                            marshalled
+                                .arguments
+                                .push(format!("Lib.{CONTINUATION_ADDRESS}()"));
+                            params.push(token);
                         }
                     }
                 }
             }
         }
-        let (returns, mut body, tail) =
-            self.return_shape(&mut marshalled, success_out, writeback_buffer.as_deref())?;
+        let (returns, mut body, tail) = self.return_shape(
+            &mut marshalled,
+            success_out,
+            writeback_buffer.as_deref(),
+            completion_status,
+        )?;
         let mut statements = marshalled.setup;
         statements.append(&mut body);
         for _ in 0..marshalled.pins {
@@ -489,7 +717,7 @@ impl<'a> WrapperBuilder<'a> {
         }
         statements.extend(tail);
         Ok(Wrapper {
-            name: method.c_function().name().to_owned(),
+            name: self.name.clone(),
             params,
             returns,
             body: statements,
@@ -502,6 +730,45 @@ impl<'a> WrapperBuilder<'a> {
             self.downcall.lib_name().as_str(),
             marshalled.arguments.join(", ")
         )
+    }
+
+    /// Passes a Java closure token to C as a `(call, cell, release)` triple.
+    fn closure(
+        &self,
+        closure: &JniClosureParameter,
+        params: &mut Vec<WrapperParameter>,
+        marshalled: &mut Marshalled,
+    ) -> Result<()> {
+        let arguments = closure.c_arguments();
+        let call =
+            arguments
+                .first()
+                .map(ToString::to_string)
+                .ok_or(Error::BrokenBridgeContract {
+                    bridge: NATIVE_IMAGE_BRIDGE,
+                    invariant: "closure parameter passes a call function pointer",
+                })?;
+        let upcall = self
+            .closures
+            .iter()
+            .find(|upcall| upcall.jni_call() == call)
+            .ok_or(Error::BrokenBridgeContract {
+                bridge: NATIVE_IMAGE_BRIDGE,
+                invariant: "closure parameter names a registered closure signature",
+            })?;
+        let token = WrapperParameter::new(closure.name().as_str(), "long");
+        marshalled
+            .arguments
+            .push(format!("Lib.{}()", upcall.call_address()));
+        marshalled.arguments.push(format!(
+            "WordFactory.pointer(newHandleCell({}))",
+            token.name
+        ));
+        marshalled
+            .arguments
+            .push(format!("Lib.{}()", upcall.release_address()));
+        params.push(token);
+        Ok(())
     }
 
     fn bytes(
@@ -634,9 +901,9 @@ impl<'a> WrapperBuilder<'a> {
         marshalled: &mut Marshalled,
         success_out: Option<&SuccessOutReturn>,
         writeback_buffer: Option<&str>,
+        completion_status: bool,
     ) -> Result<(String, Vec<String>, Vec<String>)> {
-        let method = self.method;
-        let returns = method.returns();
+        let returns = self.returns;
         let mut body = Vec::new();
         let mut tail = Vec::new();
         let result_type = match returns {
@@ -650,7 +917,8 @@ impl<'a> WrapperBuilder<'a> {
             NativeReturn::EncodedErrorValue(out) => Self::success_java_type(out.success())?,
             NativeReturn::Callback(_) => "long".to_owned(),
         };
-        let needs_result_local = marshalled.pins > 0 && result_type != "void";
+        let needs_result_local =
+            (marshalled.pins > 0 || completion_status) && result_type != "void";
         let finish = |body: &mut Vec<String>, tail: &mut Vec<String>, value: String| {
             if needs_result_local {
                 body.push(format!("__result = {value};"));
@@ -734,6 +1002,10 @@ impl<'a> WrapperBuilder<'a> {
             }
         }
         let _ = success_out;
+        if completion_status {
+            // The poll call reports failure through bridge-owned status storage.
+            tail.insert(0, "checkStatus(__boltffi_status.read());".to_owned());
+        }
         if needs_result_local {
             marshalled
                 .setup

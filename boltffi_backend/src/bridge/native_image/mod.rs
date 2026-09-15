@@ -19,6 +19,7 @@ const NATIVE_IMAGE_BRIDGE: &str = "native-image";
 
 pub use bridge::{NativeImageBridge, TransitionPolicy};
 pub use contract::{
-    CallbackUpcall, Downcall, JavaCType, LibParameter, NativeImageContract, ShimFunction,
-    Trampoline, Transition, Wrapper, WrapperParameter,
+    CallbackUpcall, ClosureUpcall, CompletionCall, CompletionUpcall, Downcall, JavaCType,
+    LibParameter, NativeImageContract, ShimFunction, Trampoline, Transition, Wrapper,
+    WrapperParameter,
 };

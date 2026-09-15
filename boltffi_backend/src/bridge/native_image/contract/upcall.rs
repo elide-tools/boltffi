@@ -21,7 +21,8 @@ use crate::{
 
 use super::{
     super::NATIVE_IMAGE_BRIDGE,
-    JavaCType, ShimFunction,
+    CompletionUpcall, JavaCType, ShimFunction,
+    asynchronous::{completion_names, payload_suffix},
     shim::{Pointerized, c_declaration},
 };
 
@@ -42,6 +43,23 @@ pub struct Trampoline {
 }
 
 impl Trampoline {
+    /// Creates one `@CEntryPoint` trampoline.
+    pub(super) fn new(
+        entry_symbol: String,
+        java_name: String,
+        java_params: String,
+        java_returns: JavaCType,
+        body: Vec<String>,
+    ) -> Self {
+        Self {
+            entry_symbol,
+            java_name,
+            java_params,
+            java_returns,
+            body,
+        }
+    }
+
     /// Returns the exported symbol name.
     pub fn entry_symbol(&self) -> &str {
         &self.entry_symbol
@@ -99,6 +117,8 @@ impl CallbackUpcall {
         registration: &CallbackRegistration,
         callback: &c::Callback,
         create_handle_lib: &str,
+        completions: &[CompletionUpcall],
+        callbacks: &[c::Callback],
     ) -> Result<Self> {
         let stem = registration.vtable_type().as_str();
         let dispatch_class = registration.class().class_name().to_owned();
@@ -170,7 +190,8 @@ impl CallbackUpcall {
             format!(".{clone_field} = {clone_fn}"),
         ];
         for (method, slot) in registration.methods().iter().zip(callback.methods()) {
-            let (trampoline, shim) = Self::slot(method, slot, &dispatch_class)?;
+            let (trampoline, shim) =
+                Self::slot(method, slot, &dispatch_class, completions, callbacks)?;
             vtable_init.push(format!(
                 ".{} = {}",
                 slot.name().as_str(),
@@ -203,9 +224,11 @@ impl CallbackUpcall {
         method: &CallbackMethod,
         slot: &c::CallbackSlot,
         dispatch_class: &str,
+        completions: &[CompletionUpcall],
+        callbacks: &[c::Callback],
     ) -> Result<(Trampoline, ShimFunction)> {
-        if slot.is_asynchronous() {
-            return Err(unsupported("asynchronous callback method"));
+        if method.returns_closure() {
+            return Err(unsupported("callback method returning a closure"));
         }
         let function = method.function().as_str().to_owned();
         let entry = format!("boltffi_ni_java_{function}");
@@ -224,6 +247,7 @@ impl CallbackUpcall {
 
         let mut setup = Vec::new();
         let mut arguments = vec!["__cell.token()".to_owned()];
+        let mut failure_completion: Option<String> = None;
         let handle_name = slot.parameters()[0].name();
         for (position, argument) in method.jvm_arguments().iter().enumerate() {
             if let Some((parameter, _)) = argument.value() {
@@ -265,12 +289,29 @@ impl CallbackUpcall {
                     record.parameter().as_str()
                 ));
                 arguments.push(record.array().as_str().to_owned());
-            } else if argument.callback_handle().is_some() {
-                return Err(unsupported("callback handle argument in callback method"));
+            } else if let Some(handle) = argument.callback_handle() {
+                // The slot receives the handle by value; the shim passes its address.
+                setup.push(format!(
+                    "long {} = storeOwnedHandle((CallbackHandle) {});",
+                    handle.handle().as_str(),
+                    handle.parameter().as_str()
+                ));
+                arguments.push(handle.handle().as_str().to_owned());
             } else if argument.closure_handle().is_some() {
                 return Err(unsupported("closure argument in callback method"));
-            } else if argument.completion().is_some() {
-                return Err(unsupported("asynchronous callback completion"));
+            } else if let Some(completion) = argument.completion() {
+                let (callback, context) =
+                    completion_names(slot).ok_or(Error::BrokenBridgeContract {
+                        bridge: NATIVE_IMAGE_BRIDGE,
+                        invariant: "asynchronous slot has a completion parameter group",
+                    })?;
+                let suffix = payload_suffix(completion.payload());
+                failure_completion = completions
+                    .iter()
+                    .find(|upcall| upcall.suffix() == suffix)
+                    .map(|upcall| format!("Lib.{}({callback}, {context});", upcall.failure_lib()));
+                arguments.push(format!("{callback}.rawValue()"));
+                arguments.push(format!("{context}.rawValue()"));
             } else {
                 return Err(Error::BrokenBridgeContract {
                     bridge: NATIVE_IMAGE_BRIDGE,
@@ -284,63 +325,27 @@ impl CallbackUpcall {
             arguments.join(", ")
         );
 
-        let mut body = Vec::new();
-        let failure;
-        if method.returns_callback_handle() || method.returns_closure() {
-            return Err(unsupported("callback method returning a handle"));
-        }
-        if pointerized.out_param {
-            match slot.returns() {
-                c::Type::Buffer => {
-                    body.push("zeroBuffer((FfiBuf) __out);".to_owned());
-                    body.push("try {".to_owned());
-                    body.extend(setup.iter().map(|line| format!("    {line}")));
-                    body.push(format!("    byte[] __value = {call};"));
-                    body.push("    writeBuffer((FfiBuf) __out, __value);".to_owned());
-                }
-                c::Type::DirectRecord(id) => {
-                    body.push(format!(
-                        "zeroMemory(__out, SizeOf.get({}Struct.class));",
-                        id.as_str()
-                    ));
-                    body.push("try {".to_owned());
-                    body.extend(setup.iter().map(|line| format!("    {line}")));
-                    body.push(format!("    byte[] __value = {call};"));
-                    body.push(format!(
-                        "    writeRecord(__out, __value, SizeOf.get({}Struct.class));",
-                        id.as_str()
-                    ));
-                }
-                _ => return Err(unsupported("callback method returning this struct")),
-            }
-            failure = None;
-        } else if pointerized.status_return {
-            body.push("try {".to_owned());
-            body.extend(setup.iter().map(|line| format!("    {line}")));
-            body.push(format!("    return {call};"));
-            failure = Some("1".to_owned());
-        } else if pointerized.returns.is_void() {
-            body.push("try {".to_owned());
-            body.extend(setup.iter().map(|line| format!("    {line}")));
-            body.push(format!("    {call};"));
-            failure = None;
-        } else {
-            body.push("try {".to_owned());
-            body.extend(setup.iter().map(|line| format!("    {line}")));
-            body.push(format!("    return {call};"));
-            failure = Some(match pointerized.returns {
-                JavaCType::Boolean => "false".to_owned(),
-                JavaCType::Float => "0.0f".to_owned(),
-                JavaCType::Double => "0.0".to_owned(),
-                _ => "0".to_owned(),
-            });
-        }
-        body.push("} catch (Throwable __failure) {".to_owned());
-        match &failure {
-            Some(value) => body.push(format!("    return {value};")),
-            None => body.push("    // Failure leaves the zeroed output in place.".to_owned()),
-        }
-        body.push("}".to_owned());
+        let body = match (slot.is_asynchronous(), failure_completion) {
+            // An async slot returns before the work finishes; a Java failure has
+            // to be reported by completing the future Rust is already waiting on.
+            (true, Some(failure)) => std::iter::once("try {".to_owned())
+                .chain(setup.iter().map(|line| format!("    {line}")))
+                .chain([
+                    format!("    {call};"),
+                    "} catch (Throwable __failure) {".to_owned(),
+                    format!("    {failure}"),
+                    "}".to_owned(),
+                ])
+                .collect(),
+            (true, None) => return Err(unsupported("asynchronous callback completion")),
+            (false, _) => trampoline_body(
+                &call,
+                &setup,
+                &pointerized,
+                slot.returns(),
+                parameter_helper(slot.returns(), callbacks).as_deref(),
+            )?,
+        };
 
         let trampoline = Trampoline {
             entry_symbol: entry.clone(),
@@ -438,7 +443,99 @@ impl CallbackUpcall {
     }
 }
 
-fn copy_helper(ty: JniType) -> &'static str {
+/// Renders the guarded Java statements of one upcall trampoline.
+///
+/// Every upcall body has the same shape: zero any output storage, run the
+/// argument conversions, call the host dispatcher, and swallow a Java failure
+/// into the C failure value, because there is no exception channel into Rust.
+pub(super) fn trampoline_body(
+    call: &str,
+    setup: &[String],
+    pointerized: &Pointerized,
+    returns: &c::Type,
+    callback_handle_helper: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut body = Vec::new();
+    let failure;
+    if pointerized.out_param {
+        match returns {
+            c::Type::Buffer => {
+                body.push("zeroBuffer((FfiBuf) __out);".to_owned());
+                body.push("try {".to_owned());
+                body.extend(setup.iter().map(|line| format!("    {line}")));
+                body.push(format!("    byte[] __value = {call};"));
+                body.push("    writeBuffer((FfiBuf) __out, __value);".to_owned());
+            }
+            c::Type::DirectRecord(id) => {
+                body.push(format!(
+                    "zeroMemory(__out, SizeOf.get({}Struct.class));",
+                    id.as_str()
+                ));
+                body.push("try {".to_owned());
+                body.extend(setup.iter().map(|line| format!("    {line}")));
+                body.push(format!("    byte[] __value = {call};"));
+                body.push(format!(
+                    "    writeRecord(__out, __value, SizeOf.get({}Struct.class));",
+                    id.as_str()
+                ));
+            }
+            c::Type::CallbackHandle(_) => {
+                let helper = callback_handle_helper
+                    .ok_or_else(|| unsupported("callback handle returned by this upcall"))?;
+                body.push("zeroCallbackHandle((CallbackHandle) __out);".to_owned());
+                body.push("try {".to_owned());
+                body.extend(setup.iter().map(|line| format!("    {line}")));
+                body.push(format!("    long __token = {call};"));
+                body.push(format!("    {helper}(__token, (CallbackHandle) __out);"));
+            }
+            _ => return Err(unsupported("upcall returning this struct")),
+        }
+        failure = None;
+    } else if pointerized.status_return {
+        body.push("try {".to_owned());
+        body.extend(setup.iter().map(|line| format!("    {line}")));
+        body.push(format!("    return {call};"));
+        failure = Some("1".to_owned());
+    } else if pointerized.returns.is_void() {
+        body.push("try {".to_owned());
+        body.extend(setup.iter().map(|line| format!("    {line}")));
+        body.push(format!("    {call};"));
+        failure = None;
+    } else {
+        body.push("try {".to_owned());
+        body.extend(setup.iter().map(|line| format!("    {line}")));
+        body.push(format!("    return {call};"));
+        failure = Some(match pointerized.returns {
+            JavaCType::Boolean => "false".to_owned(),
+            JavaCType::Float => "0.0f".to_owned(),
+            JavaCType::Double => "0.0".to_owned(),
+            _ => "0".to_owned(),
+        });
+    }
+    body.push("} catch (Throwable __failure) {".to_owned());
+    match &failure {
+        Some(value) => body.push(format!("    return {value};")),
+        None => body.push("    // Failure leaves the zeroed output in place.".to_owned()),
+    }
+    body.push("}".to_owned());
+    Ok(body)
+}
+
+/// Returns the Java helper that turns a host token into a `BoltFFICallbackHandle`.
+///
+/// A callback returned from Java is only a registry token until it is paired
+/// with the vtable Rust expects, which the per-trait helper does.
+pub(super) fn parameter_helper(returns: &c::Type, callbacks: &[c::Callback]) -> Option<String> {
+    let c::Type::CallbackHandle(id) = returns else {
+        return None;
+    };
+    callbacks
+        .iter()
+        .find(|callback| callback.id() == *id)
+        .map(|callback| format!("{}_parameter", callback.vtable().name()))
+}
+
+pub(super) fn copy_helper(ty: JniType) -> &'static str {
     match ty {
         JniType::Boolean => "copyBooleans",
         JniType::Byte => "copyBytes",
@@ -450,7 +547,7 @@ fn copy_helper(ty: JniType) -> &'static str {
     }
 }
 
-fn unsupported(shape: &'static str) -> Error {
+pub(super) fn unsupported(shape: &'static str) -> Error {
     Error::UnsupportedTarget {
         target: NATIVE_IMAGE_BRIDGE,
         shape,

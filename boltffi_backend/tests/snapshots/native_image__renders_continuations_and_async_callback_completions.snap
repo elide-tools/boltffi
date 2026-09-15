@@ -1,0 +1,695 @@
+---
+source: boltffi_backend/tests/native_image.rs
+expression: out
+---
+===== com/boltffi/demo/BoltFFINativeImage.java =====
+package com.boltffi.demo;
+
+import java.util.Collections;
+import java.util.List;
+import org.graalvm.nativeimage.CurrentIsolate;
+import org.graalvm.nativeimage.Isolate;
+import org.graalvm.nativeimage.PinnedObject;
+import org.graalvm.nativeimage.StackValue;
+import org.graalvm.nativeimage.UnmanagedMemory;
+import org.graalvm.nativeimage.c.CContext;
+import org.graalvm.nativeimage.c.function.CEntryPoint;
+import org.graalvm.nativeimage.c.function.CEntryPointLiteral;
+import org.graalvm.nativeimage.c.function.CFunction;
+import org.graalvm.nativeimage.c.function.CFunctionPointer;
+import org.graalvm.nativeimage.c.function.CLibrary;
+import org.graalvm.nativeimage.c.function.InvokeCFunctionPointer;
+import org.graalvm.nativeimage.c.struct.CField;
+import org.graalvm.nativeimage.c.struct.CStruct;
+import org.graalvm.nativeimage.c.struct.SizeOf;
+import org.graalvm.nativeimage.c.type.CCharPointer;
+import org.graalvm.nativeimage.c.type.CTypeConversion;
+import org.graalvm.word.PointerBase;
+import org.graalvm.word.WordFactory;
+
+@CContext(BoltFFINativeImage.Directives.class)
+@CLibrary(value = "demo_core", requireStatic = true)
+final class BoltFFINativeImage {
+    private BoltFFINativeImage() {}
+
+    /** Build-time directives: the generated C header and its include directory. */
+    static final class Directives implements CContext.Directives {
+        @Override
+        public List<String> getHeaderFiles() {
+            return java.util.Arrays.asList("<demo.h>", "<native_image_glue.h>");
+        }
+
+        @Override
+        public List<String> getOptions() {
+            return Collections.singletonList("-I" + System.getProperty("boltffi.include", "."));
+        }
+    }
+
+    /** Owned BoltFFI byte buffer (`FfiBuf_u8`) viewed through a pointer. */
+    @CStruct("FfiBuf_u8")
+    interface FfiBuf extends PointerBase {
+        @CField("ptr") CCharPointer ptr();
+        @CField("ptr") void ptr(CCharPointer value);
+        @CField("len") long len();
+        @CField("len") void len(long value);
+        @CField("cap") void cap(long value);
+        @CField("align") void align(long value);
+    }
+
+    /** Unmanaged cell behind a Java-owned callback handle. */
+    @CStruct("BoltFFINativeImageHandleCell")
+    interface HandleCell extends PointerBase {
+        @CField("isolate") Isolate isolate();
+        @CField("isolate") void isolate(Isolate value);
+        @CField("token") long token();
+        @CField("token") void token(long value);
+    }
+
+    /** `BoltFFICallbackHandle` viewed through a pointer. */
+    @CStruct("BoltFFICallbackHandle")
+    interface CallbackHandle extends PointerBase {
+        @CField("handle") long handle();
+        @CField("handle") void handle(long value);
+        @CField("vtable") PointerBase vtable();
+        @CField("vtable") void vtable(PointerBase value);
+    }
+
+    interface FreeSlot extends CFunctionPointer {
+        @InvokeCFunctionPointer void invoke(long handle);
+    }
+
+    interface CloneSlot extends CFunctionPointer {
+        @InvokeCFunctionPointer long invoke(long handle);
+    }
+
+    /** Leading free and clone slots of every callback vtable. */
+    @CStruct("BoltFFINativeImageVTablePrefix")
+    interface VTablePrefix extends PointerBase {
+        @CField("free") FreeSlot free();
+        @CField("clone") CloneSlot cloneSlot();
+    }
+
+    /** Enters the isolate stored in the handle cell, attaching foreign threads on first use. */
+    static final class AttachPrologue implements com.oracle.svm.guest.staging.c.function.CEntryPointOptions.Prologue {
+        @com.oracle.svm.shared.Uninterruptible(reason = "Entry point prologue runs before the isolate is entered.")
+        static int enter(HandleCell cell) {
+            return com.oracle.svm.guest.staging.c.function.CEntryPointActions.enterAttachThread(cell.isolate(), true);
+        }
+    }
+
+    static {
+        Lib.boltffi_ni_register_callbacks();
+    }
+
+    /** Allocates the unmanaged cell Rust receives as a Java-owned callback handle. */
+    static long newHandleCell(long token) {
+        HandleCell cell = UnmanagedMemory.malloc(SizeOf.get(HandleCell.class));
+        cell.isolate(CurrentIsolate.getIsolate());
+        cell.token(token);
+        return cell.rawValue();
+    }
+
+    /** Copies a Rust-owned callback handle into unmanaged memory and returns its address as the Java token. */
+    static long storeOwnedHandle(CallbackHandle value) {
+        if (value.handle() == 0L || value.vtable().isNull()) {
+            return 0L;
+        }
+        CallbackHandle stored = UnmanagedMemory.malloc(SizeOf.get(CallbackHandle.class));
+        stored.handle(value.handle());
+        stored.vtable(value.vtable());
+        return stored.rawValue();
+    }
+
+    /** Resolves a Rust-owned callback handle token into the stored `BoltFFICallbackHandle`. */
+    static CallbackHandle ownedHandle(long token) {
+        CallbackHandle stored = WordFactory.pointer(token);
+        if (stored.isNull() || stored.handle() == 0L || stored.vtable().isNull()) {
+            throw new RuntimeException("BoltFFI callback handle was null or invalid");
+        }
+        return stored;
+    }
+
+    static long cloneOwnedHandle(long token) {
+        CallbackHandle stored = WordFactory.pointer(token);
+        if (stored.isNull() || stored.handle() == 0L || stored.vtable().isNull()) {
+            return 0L;
+        }
+        VTablePrefix prefix = (VTablePrefix) stored.vtable();
+        long cloned = prefix.cloneSlot().invoke(stored.handle());
+        if (cloned == 0L) {
+            return 0L;
+        }
+        CallbackHandle copy = UnmanagedMemory.malloc(SizeOf.get(CallbackHandle.class));
+        copy.handle(cloned);
+        copy.vtable(stored.vtable());
+        return copy.rawValue();
+    }
+
+    static void releaseOwnedHandle(long token) {
+        CallbackHandle stored = WordFactory.pointer(token);
+        if (stored.isNull()) {
+            return;
+        }
+        if (stored.handle() != 0L && stored.vtable().isNonNull()) {
+            ((VTablePrefix) stored.vtable()).free().invoke(stored.handle());
+        }
+        UnmanagedMemory.free(stored);
+    }
+
+    /** Converts a host token for `WatcherCallbacks` into a `BoltFFICallbackHandle`. */
+    static void ___WatcherVTable_parameter(long token, CallbackHandle out) {
+        if ((token & 1L) != 0L) {
+            Lib.boltffi_ni_boltffi_create_callback_demo_watcher(newHandleCell(token), out);
+            return;
+        }
+        CallbackHandle stored = WordFactory.pointer(token);
+        if (stored.isNull() || stored.handle() == 0L || stored.vtable().isNull()) {
+            out.handle(0L);
+            out.vtable(WordFactory.nullPointer());
+            return;
+        }
+        out.handle(((VTablePrefix) stored.vtable()).cloneSlot().invoke(stored.handle()));
+        out.vtable(stored.vtable());
+    }
+
+    static void zeroCallbackHandle(CallbackHandle handle) {
+        handle.handle(0L);
+        handle.vtable(WordFactory.nullPointer());
+    }
+
+    static void zeroBuffer(FfiBuf buffer) {
+        buffer.ptr(WordFactory.nullPointer());
+        buffer.len(0L);
+        buffer.cap(0L);
+        buffer.align(0L);
+    }
+
+    /** Returns the base address of a direct buffer with at least `required` capacity. */
+    static long directAddress(java.nio.ByteBuffer buffer, long required) {
+        if (buffer == null) {
+            throw new IllegalArgumentException("BoltFFI direct buffer argument was null");
+        }
+        if (required < 0) {
+            throw new IllegalArgumentException("BoltFFI direct buffer length was negative");
+        }
+        if (!buffer.isDirect()) {
+            throw new IllegalArgumentException("BoltFFI argument was not a direct buffer");
+        }
+        if (buffer.capacity() < required) {
+            throw new IllegalArgumentException("BoltFFI direct buffer capacity was too small");
+        }
+        return java.lang.foreign.MemorySegment.ofBuffer(buffer.duplicate().clear()).address();
+    }
+
+    /** Copies an owned Rust buffer into a Java array and releases it. */
+    static byte[] takeBuffer(FfiBuf buffer) {
+        long length = buffer.len();
+        if (buffer.ptr().isNull()) {
+            if (length != 0) {
+                throw new RuntimeException("BoltFFI buffer pointer was null with non-zero length");
+            }
+            return new byte[0];
+        }
+        if (length > Integer.MAX_VALUE) {
+            Lib.boltffi_ni_boltffi_free_buf(buffer);
+            throw new RuntimeException("BoltFFI buffer too large for Java byte array");
+        }
+        byte[] bytes = new byte[(int) length];
+        CTypeConversion.asByteBuffer(buffer.ptr(), (int) length).get(bytes);
+        Lib.boltffi_ni_boltffi_free_buf(buffer);
+        return bytes;
+    }
+
+    static void zeroMemory(PointerBase pointer, int length) {
+        CTypeConversion.asByteBuffer(pointer, length).put(new byte[length]);
+    }
+
+    static byte[] copyBytes(PointerBase pointer, long length) {
+        if (length > Integer.MAX_VALUE) {
+            throw new RuntimeException("BoltFFI byte slice too large for Java array");
+        }
+        byte[] bytes = new byte[(int) length];
+        if (length != 0) {
+            CTypeConversion.asByteBuffer(pointer, (int) length).get(bytes);
+        }
+        return bytes;
+    }
+
+    static boolean[] copyBooleans(PointerBase pointer, long length) {
+        byte[] bytes = copyBytes(pointer, length);
+        boolean[] values = new boolean[bytes.length];
+        for (int i = 0; i < bytes.length; i++) values[i] = bytes[i] != 0;
+        return values;
+    }
+
+    static short[] copyShorts(PointerBase pointer, long length) {
+        short[] values = new short[checkedLength(length, 2)];
+        if (length != 0) CTypeConversion.asByteBuffer(pointer, values.length * 2).order(java.nio.ByteOrder.nativeOrder()).asShortBuffer().get(values);
+        return values;
+    }
+
+    static int[] copyInts(PointerBase pointer, long length) {
+        int[] values = new int[checkedLength(length, 4)];
+        if (length != 0) CTypeConversion.asByteBuffer(pointer, values.length * 4).order(java.nio.ByteOrder.nativeOrder()).asIntBuffer().get(values);
+        return values;
+    }
+
+    static long[] copyLongs(PointerBase pointer, long length) {
+        long[] values = new long[checkedLength(length, 8)];
+        if (length != 0) CTypeConversion.asByteBuffer(pointer, values.length * 8).order(java.nio.ByteOrder.nativeOrder()).asLongBuffer().get(values);
+        return values;
+    }
+
+    static float[] copyFloats(PointerBase pointer, long length) {
+        float[] values = new float[checkedLength(length, 4)];
+        if (length != 0) CTypeConversion.asByteBuffer(pointer, values.length * 4).order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer().get(values);
+        return values;
+    }
+
+    static double[] copyDoubles(PointerBase pointer, long length) {
+        double[] values = new double[checkedLength(length, 8)];
+        if (length != 0) CTypeConversion.asByteBuffer(pointer, values.length * 8).order(java.nio.ByteOrder.nativeOrder()).asDoubleBuffer().get(values);
+        return values;
+    }
+
+    private static int checkedLength(long length, int width) {
+        if (length < 0 || length > Integer.MAX_VALUE / width) {
+            throw new RuntimeException("BoltFFI vector argument too large for Java array");
+        }
+        return (int) length;
+    }
+
+    /** Returns the byte length of a stream batch buffer holding `maxCount` items. */
+    static int checkedBatchBytes(long maxCount, int itemSize) {
+        if (maxCount < 0) {
+            throw new IllegalArgumentException("BoltFFI stream batch size was negative");
+        }
+        if (maxCount > Integer.MAX_VALUE / itemSize) {
+            throw new RuntimeException("BoltFFI stream batch allocation is too large");
+        }
+        return (int) maxCount * itemSize;
+    }
+
+    static byte[] copyRecord(PointerBase pointer, int size) {
+        return copyBytes(pointer, size);
+    }
+
+    static void checkRecordLength(byte[] value, int size) {
+        if (value == null || value.length != size) {
+            throw new IllegalArgumentException("BoltFFI record byte array length did not match the C record size");
+        }
+    }
+
+    static void writeRecord(PointerBase pointer, byte[] value, int size) {
+        if (value == null || value.length != size) {
+            throw new IllegalArgumentException("BoltFFI record byte array length did not match the C record size");
+        }
+        CTypeConversion.asByteBuffer(pointer, size).put(value);
+    }
+
+    /** Copies Java bytes into a Rust-owned buffer at `out`. */
+    static void writeBuffer(FfiBuf out, byte[] value) {
+        if (value == null) {
+            throw new RuntimeException("BoltFFI byte array return was null");
+        }
+        if (value.length == 0) {
+            zeroBuffer(out);
+            return;
+        }
+        try (PinnedObject pin = PinnedObject.create(value)) {
+            Lib.boltffi_ni_boltffi_buf_from_bytes(pin.addressOfArrayElement(0), (long) value.length, out);
+        }
+    }
+
+    static void checkStatus(int code) {
+        if (code != 0) {
+            throw new RuntimeException("BoltFFI call failed");
+        }
+    }
+
+    static void checkErrorBuffer(FfiBuf error) {
+        if (error.ptr().isNonNull() || error.len() != 0) {
+            throw new BoltFfiErrorBufferException(takeBuffer(error));
+        }
+    }
+
+    /** Direct declarations of the C ABI (or its pointer-ABI shims). */
+    static final class Lib {
+        private Lib() {}
+
+        @CFunction(transition = CFunction.Transition.NO_TRANSITION)
+        static native void boltffi_ni_boltffi_free_buf(org.graalvm.word.PointerBase buf);
+
+        @CFunction(transition = CFunction.Transition.NO_TRANSITION)
+        static native void boltffi_ni_boltffi_buf_from_bytes(org.graalvm.word.PointerBase ptr, long len, org.graalvm.word.PointerBase __out);
+
+        @CFunction
+        static native void boltffi_ni_boltffi_create_callback_demo_watcher(long handle, org.graalvm.word.PointerBase __out);
+
+        @CFunction(transition = CFunction.Transition.NO_TRANSITION)
+        static native org.graalvm.word.PointerBase boltffi_ni_continuation_callback();
+
+        @CFunction
+        static native void boltffi_ni_boltffi_async_callback_complete_Bytes(org.graalvm.word.PointerBase callback, org.graalvm.word.PointerBase context, org.graalvm.word.PointerBase payload);
+
+        @CFunction
+        static native void boltffi_ni_boltffi_async_callback_complete_Bytes_failure(org.graalvm.word.PointerBase callback, org.graalvm.word.PointerBase context);
+
+        @CFunction
+        static native void boltffi_ni_boltffi_async_callback_complete_Bytes_error(org.graalvm.word.PointerBase callback, org.graalvm.word.PointerBase context, org.graalvm.word.PointerBase payload);
+
+        @CFunction
+        static native void boltffi_ni_boltffi_async_callback_complete_U32(org.graalvm.word.PointerBase callback, org.graalvm.word.PointerBase context, int payload);
+
+        @CFunction
+        static native void boltffi_ni_boltffi_async_callback_complete_U32_failure(org.graalvm.word.PointerBase callback, org.graalvm.word.PointerBase context);
+
+        @CFunction
+        static native void boltffi_ni_boltffi_async_callback_complete_U32_error(org.graalvm.word.PointerBase callback, org.graalvm.word.PointerBase context, int payload);
+
+        @CFunction
+        static native void boltffi_ni_register_callbacks();
+
+        @CFunction
+        static native org.graalvm.word.PointerBase boltffi_function_demo_load(int id);
+
+        @CFunction
+        static native byte boltffi_async_function_demo_load_poll(org.graalvm.word.PointerBase handle, long callback_data, org.graalvm.word.PointerBase callback);
+
+        @CFunction
+        static native void boltffi_ni_boltffi_async_function_demo_load_complete(org.graalvm.word.PointerBase handle, org.graalvm.word.PointerBase out_status, org.graalvm.word.PointerBase __out);
+
+        @CFunction
+        static native void boltffi_ni_boltffi_async_function_demo_load_panic_message(org.graalvm.word.PointerBase handle, org.graalvm.word.PointerBase __out);
+
+        @CFunction
+        static native void boltffi_async_function_demo_load_cancel(org.graalvm.word.PointerBase handle);
+
+        @CFunction
+        static native void boltffi_async_function_demo_load_free(org.graalvm.word.PointerBase handle);
+
+        @CFunction
+        static native org.graalvm.word.PointerBase boltffi_function_demo_count();
+
+        @CFunction
+        static native byte boltffi_async_function_demo_count_poll(org.graalvm.word.PointerBase handle, long callback_data, org.graalvm.word.PointerBase callback);
+
+        @CFunction
+        static native void boltffi_ni_boltffi_async_function_demo_count_complete(org.graalvm.word.PointerBase handle, org.graalvm.word.PointerBase out_status, org.graalvm.word.PointerBase return_out, org.graalvm.word.PointerBase __out);
+
+        @CFunction
+        static native void boltffi_ni_boltffi_async_function_demo_count_panic_message(org.graalvm.word.PointerBase handle, org.graalvm.word.PointerBase __out);
+
+        @CFunction
+        static native void boltffi_async_function_demo_count_cancel(org.graalvm.word.PointerBase handle);
+
+        @CFunction
+        static native void boltffi_async_function_demo_count_free(org.graalvm.word.PointerBase handle);
+
+        @CFunction
+        static native int boltffi_ni_boltffi_function_demo_watch(org.graalvm.word.PointerBase watcher);
+    }
+
+    static void boltffi_async_callback_complete_Bytes(long callback, long context, byte[] result) {
+        org.graalvm.word.PointerBase __callback = WordFactory.pointer(callback);
+        org.graalvm.word.PointerBase __context = WordFactory.pointer(context);
+        FfiBuf __payload = StackValue.get(FfiBuf.class);
+        zeroBuffer(__payload);
+        writeBuffer(__payload, result);
+        Lib.boltffi_ni_boltffi_async_callback_complete_Bytes(__callback, __context, __payload);
+    }
+
+    static void boltffi_async_callback_complete_Bytes_failure(long callback, long context) {
+        org.graalvm.word.PointerBase __callback = WordFactory.pointer(callback);
+        org.graalvm.word.PointerBase __context = WordFactory.pointer(context);
+        Lib.boltffi_ni_boltffi_async_callback_complete_Bytes_failure(__callback, __context);
+    }
+
+    static void boltffi_async_callback_complete_Bytes_error(long callback, long context, byte[] result) {
+        org.graalvm.word.PointerBase __callback = WordFactory.pointer(callback);
+        org.graalvm.word.PointerBase __context = WordFactory.pointer(context);
+        FfiBuf __payload = StackValue.get(FfiBuf.class);
+        zeroBuffer(__payload);
+        writeBuffer(__payload, result);
+        Lib.boltffi_ni_boltffi_async_callback_complete_Bytes_error(__callback, __context, __payload);
+    }
+
+    static void boltffi_async_callback_complete_U32(long callback, long context, int result) {
+        org.graalvm.word.PointerBase __callback = WordFactory.pointer(callback);
+        org.graalvm.word.PointerBase __context = WordFactory.pointer(context);
+        Lib.boltffi_ni_boltffi_async_callback_complete_U32(__callback, __context, result);
+    }
+
+    static void boltffi_async_callback_complete_U32_failure(long callback, long context) {
+        org.graalvm.word.PointerBase __callback = WordFactory.pointer(callback);
+        org.graalvm.word.PointerBase __context = WordFactory.pointer(context);
+        Lib.boltffi_ni_boltffi_async_callback_complete_U32_failure(__callback, __context);
+    }
+
+    static void boltffi_async_callback_complete_U32_error(long callback, long context, int result) {
+        org.graalvm.word.PointerBase __callback = WordFactory.pointer(callback);
+        org.graalvm.word.PointerBase __context = WordFactory.pointer(context);
+        Lib.boltffi_ni_boltffi_async_callback_complete_U32_error(__callback, __context, result);
+    }
+
+    static long boltffi_function_demo_load(int id) {
+        return Lib.boltffi_function_demo_load(id);
+    }
+
+    static byte boltffi_async_function_demo_load_poll(long handle, long callback_data) {
+        return Lib.boltffi_async_function_demo_load_poll(handle, newHandleCell(callback_data), Lib.boltffi_ni_continuation_callback());
+    }
+
+    static byte[] boltffi_async_function_demo_load_complete(long handle) {
+        byte[] __result;
+        org.graalvm.nativeimage.c.type.CIntPointer __boltffi_status = StackValue.get(org.graalvm.nativeimage.c.type.CIntPointer.class);
+        __boltffi_status.write(0);
+        FfiBuf __result_buffer = StackValue.get(FfiBuf.class);
+        zeroBuffer(__result_buffer);
+        Lib.boltffi_ni_boltffi_async_function_demo_load_complete(handle, __boltffi_status, __result_buffer);
+        __result = takeBuffer(__result_buffer);
+        checkStatus(__boltffi_status.read());
+        return __result;
+    }
+
+    static byte[] boltffi_async_function_demo_load_panic_message(long handle) {
+        FfiBuf __result_buffer = StackValue.get(FfiBuf.class);
+        zeroBuffer(__result_buffer);
+        Lib.boltffi_ni_boltffi_async_function_demo_load_panic_message(handle, __result_buffer);
+        return takeBuffer(__result_buffer);
+    }
+
+    static void boltffi_async_function_demo_load_cancel(long handle) {
+        Lib.boltffi_async_function_demo_load_cancel(handle);
+    }
+
+    static void boltffi_async_function_demo_load_free(long handle) {
+        Lib.boltffi_async_function_demo_load_free(handle);
+    }
+
+    static long boltffi_function_demo_count() {
+        return Lib.boltffi_function_demo_count();
+    }
+
+    static byte boltffi_async_function_demo_count_poll(long handle, long callback_data) {
+        return Lib.boltffi_async_function_demo_count_poll(handle, newHandleCell(callback_data), Lib.boltffi_ni_continuation_callback());
+    }
+
+    static int boltffi_async_function_demo_count_complete(long handle) {
+        int __result;
+        org.graalvm.nativeimage.c.type.CIntPointer __boltffi_status = StackValue.get(org.graalvm.nativeimage.c.type.CIntPointer.class);
+        __boltffi_status.write(0);
+        org.graalvm.nativeimage.c.type.CIntPointer __boltffi_return = StackValue.get(org.graalvm.nativeimage.c.type.CIntPointer.class);
+        FfiBuf __error = StackValue.get(FfiBuf.class);
+        zeroBuffer(__error);
+        Lib.boltffi_ni_boltffi_async_function_demo_count_complete(handle, __boltffi_status, __boltffi_return, __error);
+        checkErrorBuffer(__error);
+        __result = __boltffi_return.read();
+        checkStatus(__boltffi_status.read());
+        return __result;
+    }
+
+    static byte[] boltffi_async_function_demo_count_panic_message(long handle) {
+        FfiBuf __result_buffer = StackValue.get(FfiBuf.class);
+        zeroBuffer(__result_buffer);
+        Lib.boltffi_ni_boltffi_async_function_demo_count_panic_message(handle, __result_buffer);
+        return takeBuffer(__result_buffer);
+    }
+
+    static void boltffi_async_function_demo_count_cancel(long handle) {
+        Lib.boltffi_async_function_demo_count_cancel(handle);
+    }
+
+    static void boltffi_async_function_demo_count_free(long handle) {
+        Lib.boltffi_async_function_demo_count_free(handle);
+    }
+
+    static void boltffi_function_demo_watch(long watcher) {
+        CallbackHandle __cb_watcher = StackValue.get(CallbackHandle.class);
+        ___WatcherVTable_parameter(watcher, __cb_watcher);
+        checkStatus(Lib.boltffi_ni_boltffi_function_demo_watch(__cb_watcher));
+    }
+
+    @CEntryPoint(name = "boltffi_ni_java____WatcherVTable_free")
+    @com.oracle.svm.guest.staging.c.function.CEntryPointOptions(prologue = AttachPrologue.class)
+    static void ___WatcherVTable_free(HandleCell __cell) {
+        try {
+            WatcherCallbacks.free(__cell.token());
+        } catch (Throwable __failure) {
+            // JNI glue clears the exception; nothing to report to Rust here.
+        }
+        UnmanagedMemory.free(__cell);
+    }
+
+    @CEntryPoint(name = "boltffi_ni_java____WatcherVTable_clone")
+    @com.oracle.svm.guest.staging.c.function.CEntryPointOptions(prologue = AttachPrologue.class)
+    static long ___WatcherVTable_clone(HandleCell __cell) {
+        try {
+            long __token = WatcherCallbacks.clone(__cell.token());
+            return __token == 0L ? 0L : newHandleCell(__token);
+        } catch (Throwable __failure) {
+            return 0L;
+        }
+    }
+
+    @CEntryPoint(name = "boltffi_ni_java____WatcherVTable_describe")
+    @com.oracle.svm.guest.staging.c.function.CEntryPointOptions(prologue = AttachPrologue.class)
+    static void ___WatcherVTable_describe(HandleCell __cell, int id, org.graalvm.word.PointerBase complete, org.graalvm.word.PointerBase complete_context) {
+        try {
+            WatcherCallbacks.describe(__cell.token(), id, complete.rawValue(), complete_context.rawValue());
+        } catch (Throwable __failure) {
+            Lib.boltffi_ni_boltffi_async_callback_complete_Bytes_failure(complete, complete_context);
+        }
+    }
+
+    @CEntryPoint(name = "boltffi_ni_java____WatcherVTable_total")
+    @com.oracle.svm.guest.staging.c.function.CEntryPointOptions(prologue = AttachPrologue.class)
+    static void ___WatcherVTable_total(HandleCell __cell, org.graalvm.word.PointerBase complete, org.graalvm.word.PointerBase complete_context) {
+        try {
+            WatcherCallbacks.total(__cell.token(), complete.rawValue(), complete_context.rawValue());
+        } catch (Throwable __failure) {
+            Lib.boltffi_ni_boltffi_async_callback_complete_U32_failure(complete, complete_context);
+        }
+    }
+
+    @CEntryPoint(name = "boltffi_ni_java_continuation")
+    @com.oracle.svm.guest.staging.c.function.CEntryPointOptions(prologue = AttachPrologue.class)
+    static void boltffi_ni_continuation(HandleCell __cell, byte pollResult) {
+        long __token = __cell.token();
+        UnmanagedMemory.free(__cell);
+        try {
+            Native.boltffiFutureContinuationCallback(__token, pollResult);
+        } catch (Throwable __failure) {
+            // A resumed future owns its own failure reporting.
+        }
+    }
+}
+===== native_image/native_image_glue.c =====
+// Generated by BoltFFI. Pointer-ABI shims for GraalVM Native Image @CFunction calls and @CEntryPoint upcalls.
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+#include "demo.h"
+#include "native_image_glue.h"
+
+void boltffi_ni_boltffi_free_buf(const FfiBuf_u8 *buf) {
+    boltffi_free_buf(*buf);
+}
+
+void boltffi_ni_boltffi_buf_from_bytes(const uint8_t *ptr, uintptr_t len, FfiBuf_u8 *__out) {
+    *__out = boltffi_buf_from_bytes(ptr, len);
+}
+
+void boltffi_ni_boltffi_create_callback_demo_watcher(uint64_t handle, BoltFFICallbackHandle *__out) {
+    *__out = boltffi_create_callback_demo_watcher(handle);
+}
+
+void boltffi_ni_boltffi_async_callback_complete_Bytes(void *__callback, void *__context, const FfiBuf_u8 *__payload) {
+    void (*__complete)(void *, FfiStatus, FfiBuf_u8) = (void (*)(void *, FfiStatus, FfiBuf_u8))__callback;
+    __complete(__context, (FfiStatus){ .code = 0 }, *__payload);
+}
+
+void boltffi_ni_boltffi_async_callback_complete_Bytes_failure(void *__callback, void *__context) {
+    void (*__complete)(void *, FfiStatus) = (void (*)(void *, FfiStatus))__callback;
+    __complete(__context, (FfiStatus){ .code = 1 });
+}
+
+void boltffi_ni_boltffi_async_callback_complete_Bytes_error(void *__callback, void *__context, const FfiBuf_u8 *__payload) {
+    void (*__complete)(void *, FfiStatus, FfiBuf_u8) = (void (*)(void *, FfiStatus, FfiBuf_u8))__callback;
+    __complete(__context, (FfiStatus){ .code = 1 }, *__payload);
+}
+
+void boltffi_ni_boltffi_async_callback_complete_U32(void *__callback, void *__context, uint32_t __payload) {
+    void (*__complete)(void *, FfiStatus, uint32_t) = (void (*)(void *, FfiStatus, uint32_t))__callback;
+    __complete(__context, (FfiStatus){ .code = 0 }, __payload);
+}
+
+void boltffi_ni_boltffi_async_callback_complete_U32_failure(void *__callback, void *__context) {
+    void (*__complete)(void *, FfiStatus) = (void (*)(void *, FfiStatus))__callback;
+    __complete(__context, (FfiStatus){ .code = 1 });
+}
+
+void boltffi_ni_boltffi_async_callback_complete_U32_error(void *__callback, void *__context, uint32_t __payload) {
+    void (*__complete)(void *, FfiStatus, uint32_t) = (void (*)(void *, FfiStatus, uint32_t))__callback;
+    __complete(__context, (FfiStatus){ .code = 1 }, __payload);
+}
+
+void boltffi_ni_boltffi_async_function_demo_load_complete(RustFutureHandle handle, FfiStatus *out_status, FfiBuf_u8 *__out) {
+    *__out = boltffi_async_function_demo_load_complete(handle, out_status);
+}
+
+void boltffi_ni_boltffi_async_function_demo_load_panic_message(RustFutureHandle handle, FfiBuf_u8 *__out) {
+    *__out = boltffi_async_function_demo_load_panic_message(handle);
+}
+
+void boltffi_ni_boltffi_async_function_demo_count_complete(RustFutureHandle handle, FfiStatus *out_status, uint32_t *return_out, FfiBuf_u8 *__out) {
+    *__out = boltffi_async_function_demo_count_complete(handle, out_status, return_out);
+}
+
+void boltffi_ni_boltffi_async_function_demo_count_panic_message(RustFutureHandle handle, FfiBuf_u8 *__out) {
+    *__out = boltffi_async_function_demo_count_panic_message(handle);
+}
+
+int32_t boltffi_ni_boltffi_function_demo_watch(const BoltFFICallbackHandle *watcher) {
+    return boltffi_function_demo_watch(*watcher).code;
+}
+
+extern void boltffi_ni_java____WatcherVTable_free(BoltFFINativeImageHandleCell *handle);
+static void ___WatcherVTable_free(uint64_t handle) {
+    boltffi_ni_java____WatcherVTable_free((BoltFFINativeImageHandleCell *)(uintptr_t)handle);
+}
+
+extern int64_t boltffi_ni_java____WatcherVTable_clone(BoltFFINativeImageHandleCell *handle);
+static uint64_t ___WatcherVTable_clone(uint64_t handle) {
+    return (uint64_t)boltffi_ni_java____WatcherVTable_clone((BoltFFINativeImageHandleCell *)(uintptr_t)handle);
+}
+
+extern void boltffi_ni_java____WatcherVTable_describe(BoltFFINativeImageHandleCell *handle, uint32_t id, void (*complete)(void *, FfiStatus, FfiBuf_u8), void *complete_context);
+static void ___WatcherVTable_describe(uint64_t handle, uint32_t id, void (*complete)(void *, FfiStatus, FfiBuf_u8), void *complete_context) {
+    boltffi_ni_java____WatcherVTable_describe((BoltFFINativeImageHandleCell *)(uintptr_t)handle, id, complete, complete_context);
+}
+
+extern void boltffi_ni_java____WatcherVTable_total(BoltFFINativeImageHandleCell *handle, void (*complete)(void *, FfiStatus, uint32_t), void *complete_context);
+static void ___WatcherVTable_total(uint64_t handle, void (*complete)(void *, FfiStatus, uint32_t), void *complete_context) {
+    boltffi_ni_java____WatcherVTable_total((BoltFFINativeImageHandleCell *)(uintptr_t)handle, complete, complete_context);
+}
+
+static ___WatcherVTable g____WatcherVTable_vtable = {
+    .free = ___WatcherVTable_free,
+    .clone = ___WatcherVTable_clone,
+    .describe = ___WatcherVTable_describe,
+    .total = ___WatcherVTable_total
+};
+
+extern void boltffi_ni_java_continuation(BoltFFINativeImageHandleCell *cell, int8_t poll_result);
+static void boltffi_ni_continuation_shim(uint64_t callback_data, int8_t poll_result) {
+    boltffi_ni_java_continuation((BoltFFINativeImageHandleCell *)(uintptr_t)callback_data, poll_result);
+}
+
+void *boltffi_ni_continuation_callback(void) {
+    return (void *)boltffi_ni_continuation_shim;
+}
+
+void boltffi_ni_register_callbacks(void) {
+    boltffi_register_callback_demo_watcher(&g____WatcherVTable_vtable);
+}

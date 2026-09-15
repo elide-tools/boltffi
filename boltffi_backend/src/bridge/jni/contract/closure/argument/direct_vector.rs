@@ -83,6 +83,11 @@ impl ClosureDirectVectorArgument {
         &self.pointer_type
     }
 
+    /// Returns the JNI primitive carried by each element.
+    pub fn jni_type(&self) -> JniType {
+        self.jni_type
+    }
+
     /// Returns the JNI array type.
     pub fn array_type(&self) -> TypeFragment {
         self.jni_type.as_array_type_fragment()

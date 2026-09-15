@@ -53,6 +53,13 @@ pub(super) fn render_java(contract: &NativeImageContract) -> Result<String> {
         .callbacks()
         .iter()
         .flat_map(|callback| callback.trampolines())
+        .chain(
+            contract
+                .closures()
+                .iter()
+                .flat_map(|closure| closure.trampolines()),
+        )
+        .chain(contract.continuation())
         .map(|trampoline| {
             TrampolineTemplate { trampoline }
                 .render()
