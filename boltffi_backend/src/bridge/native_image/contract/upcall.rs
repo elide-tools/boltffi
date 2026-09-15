@@ -113,6 +113,7 @@ impl CallbackUpcall {
         callback: &c::Callback,
         create_handle_lib: &str,
         completions: &[CompletionUpcall],
+        callbacks: &[c::Callback],
     ) -> Result<Self> {
         let stem = registration.vtable_type().as_str();
         let dispatch_class = registration.class().class_name().to_owned();
@@ -184,7 +185,8 @@ impl CallbackUpcall {
             format!(".{clone_field} = {clone_fn}"),
         ];
         for (method, slot) in registration.methods().iter().zip(callback.methods()) {
-            let (trampoline, shim) = Self::slot(method, slot, &dispatch_class, completions)?;
+            let (trampoline, shim) =
+                Self::slot(method, slot, &dispatch_class, completions, callbacks)?;
             vtable_init.push(format!(
                 ".{} = {}",
                 slot.name().as_str(),
@@ -218,6 +220,7 @@ impl CallbackUpcall {
         slot: &c::CallbackSlot,
         dispatch_class: &str,
         completions: &[CompletionUpcall],
+        callbacks: &[c::Callback],
     ) -> Result<(Trampoline, ShimFunction)> {
         if method.returns_closure() {
             return Err(unsupported("callback method returning a closure"));
@@ -330,7 +333,13 @@ impl CallbackUpcall {
                 ])
                 .collect(),
             (true, None) => return Err(unsupported("asynchronous callback completion")),
-            (false, _) => trampoline_body(&call, &setup, &pointerized, slot.returns(), None)?,
+            (false, _) => trampoline_body(
+                &call,
+                &setup,
+                &pointerized,
+                slot.returns(),
+                parameter_helper(slot.returns(), callbacks).as_deref(),
+            )?,
         };
 
         let trampoline = Trampoline {
@@ -505,6 +514,20 @@ pub(super) fn trampoline_body(
     }
     body.push("}".to_owned());
     Ok(body)
+}
+
+/// Returns the Java helper that turns a host token into a `BoltFFICallbackHandle`.
+///
+/// A callback returned from Java is only a registry token until it is paired
+/// with the vtable Rust expects, which the per-trait helper does.
+pub(super) fn parameter_helper(returns: &c::Type, callbacks: &[c::Callback]) -> Option<String> {
+    let c::Type::CallbackHandle(id) = returns else {
+        return None;
+    };
+    callbacks
+        .iter()
+        .find(|callback| callback.id() == *id)
+        .map(|callback| format!("{}_parameter", callback.vtable().name()))
 }
 
 pub(super) fn copy_helper(ty: JniType) -> &'static str {

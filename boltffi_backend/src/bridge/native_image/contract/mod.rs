@@ -178,6 +178,7 @@ impl NativeImageContract {
                     callback,
                     create.lib_name().as_str(),
                     &completions,
+                    c_bridge.callbacks(),
                 )
             })
             .collect::<Result<Vec<_>>>()?;

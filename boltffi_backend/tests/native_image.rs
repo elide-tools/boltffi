@@ -294,6 +294,7 @@ const CALLBACK_HANDLES: &str = r#"
     #[export]
     pub trait Parent {
         fn on_child(&self, child: Box<dyn Child>);
+        fn make_child(&self) -> Box<dyn Child>;
     }
 
     #[export]
@@ -322,6 +323,10 @@ fn renders_rust_owned_callback_handle_methods() {
         out.contains("long __boltffi_child_handle = storeOwnedHandle((CallbackHandle) child);")
     );
     assert!(out.contains("ParentCallbacks.on_child(__cell.token(), __boltffi_child_handle);"));
+    // a callback returned from Java is paired with its vtable before Rust sees it
+    assert!(out.contains("zeroCallbackHandle((CallbackHandle) __out);"));
+    assert!(out.contains("long __token = ParentCallbacks.make_child(__cell.token());"));
+    assert!(out.contains("___ChildVTable_parameter(__token, (CallbackHandle) __out);"));
     insta::assert_snapshot!(out);
 }
 
