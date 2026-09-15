@@ -41,8 +41,19 @@
   the `ClosureRegistration` handle helpers), callback-handle completion
   payloads, async callback handle methods, and closures returning callback
   handles.
-- Remaining: the closure-handle shapes above, 5 packaging, 6 runtime test,
-  7 docs.
+- Task 5 done (`595d6e37`, `c1bac4c0`): `[targets.java.jvm] binding =
+  "native-image"`, threaded through `Generation::java_jvm_binding`, and
+  `pack java` Native Image mode (staticlib check, glue compiled and appended
+  to the archive, headers staged, `native-image.properties` written).
+- Task 6 done (`ba8c442e`, `66a53b9c`): `tests/native_image_runtime.rs` builds
+  a real image with GraalVM 25 and passes 13 cases including a callback
+  invoked from a Rust thread. Fixes it forced: vtable registration is lazy
+  (the `@CContext` class initializes in the builder JVM), and every non-int
+  entry point declares a `PrologueBailout`.
+- Task 7 done (`041b9f84`, `02f3a5f8`): `docs/src/content/docs/native-image.mdx`.
+- Remaining: the closure-handle shapes above; extend the runtime test to
+  closures, async, streams, and Rust-owned handles once those compile in a
+  real image; run `pack java` in Native Image mode against a real crate.
 
 ## Global Constraints
 
