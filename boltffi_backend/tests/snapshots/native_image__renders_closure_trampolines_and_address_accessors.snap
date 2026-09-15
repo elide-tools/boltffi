@@ -263,6 +263,17 @@ final class BoltFFINativeImage {
         return (int) length;
     }
 
+    /** Returns the byte length of a stream batch buffer holding `maxCount` items. */
+    static int checkedBatchBytes(long maxCount, int itemSize) {
+        if (maxCount < 0) {
+            throw new IllegalArgumentException("BoltFFI stream batch size was negative");
+        }
+        if (maxCount > Integer.MAX_VALUE / itemSize) {
+            throw new RuntimeException("BoltFFI stream batch allocation is too large");
+        }
+        return (int) maxCount * itemSize;
+    }
+
     static byte[] copyRecord(PointerBase pointer, int size) {
         return copyBytes(pointer, size);
     }

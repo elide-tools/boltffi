@@ -242,6 +242,7 @@ fn dump_fixture() {
         Ok("handles") => CALLBACK_HANDLES,
         Ok("closures") => CLOSURES,
         Ok("async") => ASYNC,
+        Ok("streams") => STREAMS,
         _ => PRIMITIVE_FUNCTIONS,
     };
     eprintln!("{}", rendered(source));
@@ -415,5 +416,45 @@ fn renders_continuations_and_async_callback_completions() {
     assert!(out.contains("void (*__complete)(void *, FfiStatus, FfiBuf_u8) = (void (*)(void *, FfiStatus, FfiBuf_u8))__callback;"));
     assert!(out.contains("__complete(__context, (FfiStatus){ .code = 0 }, *__payload);"));
     assert!(out.contains("__complete(__context, (FfiStatus){ .code = 1 });"));
+    insta::assert_snapshot!(out);
+}
+
+const STREAMS: &str = r#"
+    use boltffi::EventSubscription;
+    use std::sync::Arc;
+
+    #[repr(C)]
+    #[data]
+    pub struct Point {
+        pub x: f64,
+        pub y: f64,
+    }
+
+    pub struct Engine;
+
+    #[export(single_threaded)]
+    impl Engine {
+        #[ffi_stream(item = Point, mode = "batch")]
+        pub fn points(&self) -> Arc<EventSubscription<Point>> { loop {} }
+
+        #[ffi_stream(item = String)]
+        pub fn names(&self) -> Arc<EventSubscription<String>> { loop {} }
+    }
+"#;
+
+#[test]
+fn renders_stream_protocol_and_direct_batch_methods() {
+    let out = rendered(STREAMS);
+    // the protocol methods render through the ordinary downcall path
+    assert!(
+        out.contains("static long boltffi_stream_demo_engine_points_subscribe(long receiver) {")
+    );
+    assert!(out.contains("static int boltffi_stream_demo_engine_points_wait(long subscription, int timeout_milliseconds) {"));
+    assert!(out.contains("newHandleCell(callback_data), Lib.boltffi_ni_continuation_callback()"));
+    // the direct batch fills a pinned Java array and returns the used prefix
+    assert!(out.contains("static byte[] boltffi_stream_demo_engine_points_pop_batch(long subscription, long maxCount) {"));
+    assert!(out.contains("byte[] __items = new byte[checkedBatchBytes(maxCount, 16)];"));
+    assert!(out.contains("try (PinnedObject __pin_items = PinnedObject.create(__items)) {"));
+    assert!(out.contains("return java.util.Arrays.copyOf(__items, (int) (__count * 16L));"));
     insta::assert_snapshot!(out);
 }

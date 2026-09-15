@@ -1,0 +1,479 @@
+---
+source: boltffi_backend/tests/native_image.rs
+expression: out
+---
+===== com/boltffi/demo/BoltFFINativeImage.java =====
+package com.boltffi.demo;
+
+import java.util.Collections;
+import java.util.List;
+import org.graalvm.nativeimage.CurrentIsolate;
+import org.graalvm.nativeimage.Isolate;
+import org.graalvm.nativeimage.PinnedObject;
+import org.graalvm.nativeimage.StackValue;
+import org.graalvm.nativeimage.UnmanagedMemory;
+import org.graalvm.nativeimage.c.CContext;
+import org.graalvm.nativeimage.c.function.CEntryPoint;
+import org.graalvm.nativeimage.c.function.CEntryPointLiteral;
+import org.graalvm.nativeimage.c.function.CFunction;
+import org.graalvm.nativeimage.c.function.CFunctionPointer;
+import org.graalvm.nativeimage.c.function.CLibrary;
+import org.graalvm.nativeimage.c.function.InvokeCFunctionPointer;
+import org.graalvm.nativeimage.c.struct.CField;
+import org.graalvm.nativeimage.c.struct.CStruct;
+import org.graalvm.nativeimage.c.struct.SizeOf;
+import org.graalvm.nativeimage.c.type.CCharPointer;
+import org.graalvm.nativeimage.c.type.CTypeConversion;
+import org.graalvm.word.PointerBase;
+import org.graalvm.word.WordFactory;
+
+@CContext(BoltFFINativeImage.Directives.class)
+@CLibrary(value = "demo_core", requireStatic = true)
+final class BoltFFINativeImage {
+    private BoltFFINativeImage() {}
+
+    /** Build-time directives: the generated C header and its include directory. */
+    static final class Directives implements CContext.Directives {
+        @Override
+        public List<String> getHeaderFiles() {
+            return java.util.Arrays.asList("<demo.h>", "<native_image_glue.h>");
+        }
+
+        @Override
+        public List<String> getOptions() {
+            return Collections.singletonList("-I" + System.getProperty("boltffi.include", "."));
+        }
+    }
+
+    /** Owned BoltFFI byte buffer (`FfiBuf_u8`) viewed through a pointer. */
+    @CStruct("FfiBuf_u8")
+    interface FfiBuf extends PointerBase {
+        @CField("ptr") CCharPointer ptr();
+        @CField("ptr") void ptr(CCharPointer value);
+        @CField("len") long len();
+        @CField("len") void len(long value);
+        @CField("cap") void cap(long value);
+        @CField("align") void align(long value);
+    }
+
+    /** Size probe for the direct record `___Point`. */
+    @CStruct("___Point")
+    interface ___PointStruct extends PointerBase {}
+
+    /** Unmanaged cell behind a Java-owned callback handle. */
+    @CStruct("BoltFFINativeImageHandleCell")
+    interface HandleCell extends PointerBase {
+        @CField("isolate") Isolate isolate();
+        @CField("isolate") void isolate(Isolate value);
+        @CField("token") long token();
+        @CField("token") void token(long value);
+    }
+
+    /** `BoltFFICallbackHandle` viewed through a pointer. */
+    @CStruct("BoltFFICallbackHandle")
+    interface CallbackHandle extends PointerBase {
+        @CField("handle") long handle();
+        @CField("handle") void handle(long value);
+        @CField("vtable") PointerBase vtable();
+        @CField("vtable") void vtable(PointerBase value);
+    }
+
+    interface FreeSlot extends CFunctionPointer {
+        @InvokeCFunctionPointer void invoke(long handle);
+    }
+
+    interface CloneSlot extends CFunctionPointer {
+        @InvokeCFunctionPointer long invoke(long handle);
+    }
+
+    /** Leading free and clone slots of every callback vtable. */
+    @CStruct("BoltFFINativeImageVTablePrefix")
+    interface VTablePrefix extends PointerBase {
+        @CField("free") FreeSlot free();
+        @CField("clone") CloneSlot cloneSlot();
+    }
+
+    /** Enters the isolate stored in the handle cell, attaching foreign threads on first use. */
+    static final class AttachPrologue implements com.oracle.svm.guest.staging.c.function.CEntryPointOptions.Prologue {
+        @com.oracle.svm.shared.Uninterruptible(reason = "Entry point prologue runs before the isolate is entered.")
+        static int enter(HandleCell cell) {
+            return com.oracle.svm.guest.staging.c.function.CEntryPointActions.enterAttachThread(cell.isolate(), true);
+        }
+    }
+
+    /** Allocates the unmanaged cell Rust receives as a Java-owned callback handle. */
+    static long newHandleCell(long token) {
+        HandleCell cell = UnmanagedMemory.malloc(SizeOf.get(HandleCell.class));
+        cell.isolate(CurrentIsolate.getIsolate());
+        cell.token(token);
+        return cell.rawValue();
+    }
+
+    /** Copies a Rust-owned callback handle into unmanaged memory and returns its address as the Java token. */
+    static long storeOwnedHandle(CallbackHandle value) {
+        if (value.handle() == 0L || value.vtable().isNull()) {
+            return 0L;
+        }
+        CallbackHandle stored = UnmanagedMemory.malloc(SizeOf.get(CallbackHandle.class));
+        stored.handle(value.handle());
+        stored.vtable(value.vtable());
+        return stored.rawValue();
+    }
+
+    /** Resolves a Rust-owned callback handle token into the stored `BoltFFICallbackHandle`. */
+    static CallbackHandle ownedHandle(long token) {
+        CallbackHandle stored = WordFactory.pointer(token);
+        if (stored.isNull() || stored.handle() == 0L || stored.vtable().isNull()) {
+            throw new RuntimeException("BoltFFI callback handle was null or invalid");
+        }
+        return stored;
+    }
+
+    static long cloneOwnedHandle(long token) {
+        CallbackHandle stored = WordFactory.pointer(token);
+        if (stored.isNull() || stored.handle() == 0L || stored.vtable().isNull()) {
+            return 0L;
+        }
+        VTablePrefix prefix = (VTablePrefix) stored.vtable();
+        long cloned = prefix.cloneSlot().invoke(stored.handle());
+        if (cloned == 0L) {
+            return 0L;
+        }
+        CallbackHandle copy = UnmanagedMemory.malloc(SizeOf.get(CallbackHandle.class));
+        copy.handle(cloned);
+        copy.vtable(stored.vtable());
+        return copy.rawValue();
+    }
+
+    static void releaseOwnedHandle(long token) {
+        CallbackHandle stored = WordFactory.pointer(token);
+        if (stored.isNull()) {
+            return;
+        }
+        if (stored.handle() != 0L && stored.vtable().isNonNull()) {
+            ((VTablePrefix) stored.vtable()).free().invoke(stored.handle());
+        }
+        UnmanagedMemory.free(stored);
+    }
+
+    static void zeroCallbackHandle(CallbackHandle handle) {
+        handle.handle(0L);
+        handle.vtable(WordFactory.nullPointer());
+    }
+
+    static void zeroBuffer(FfiBuf buffer) {
+        buffer.ptr(WordFactory.nullPointer());
+        buffer.len(0L);
+        buffer.cap(0L);
+        buffer.align(0L);
+    }
+
+    /** Returns the base address of a direct buffer with at least `required` capacity. */
+    static long directAddress(java.nio.ByteBuffer buffer, long required) {
+        if (buffer == null) {
+            throw new IllegalArgumentException("BoltFFI direct buffer argument was null");
+        }
+        if (required < 0) {
+            throw new IllegalArgumentException("BoltFFI direct buffer length was negative");
+        }
+        if (!buffer.isDirect()) {
+            throw new IllegalArgumentException("BoltFFI argument was not a direct buffer");
+        }
+        if (buffer.capacity() < required) {
+            throw new IllegalArgumentException("BoltFFI direct buffer capacity was too small");
+        }
+        return java.lang.foreign.MemorySegment.ofBuffer(buffer.duplicate().clear()).address();
+    }
+
+    /** Copies an owned Rust buffer into a Java array and releases it. */
+    static byte[] takeBuffer(FfiBuf buffer) {
+        long length = buffer.len();
+        if (buffer.ptr().isNull()) {
+            if (length != 0) {
+                throw new RuntimeException("BoltFFI buffer pointer was null with non-zero length");
+            }
+            return new byte[0];
+        }
+        if (length > Integer.MAX_VALUE) {
+            Lib.boltffi_ni_boltffi_free_buf(buffer);
+            throw new RuntimeException("BoltFFI buffer too large for Java byte array");
+        }
+        byte[] bytes = new byte[(int) length];
+        CTypeConversion.asByteBuffer(buffer.ptr(), (int) length).get(bytes);
+        Lib.boltffi_ni_boltffi_free_buf(buffer);
+        return bytes;
+    }
+
+    static void zeroMemory(PointerBase pointer, int length) {
+        CTypeConversion.asByteBuffer(pointer, length).put(new byte[length]);
+    }
+
+    static byte[] copyBytes(PointerBase pointer, long length) {
+        if (length > Integer.MAX_VALUE) {
+            throw new RuntimeException("BoltFFI byte slice too large for Java array");
+        }
+        byte[] bytes = new byte[(int) length];
+        if (length != 0) {
+            CTypeConversion.asByteBuffer(pointer, (int) length).get(bytes);
+        }
+        return bytes;
+    }
+
+    static boolean[] copyBooleans(PointerBase pointer, long length) {
+        byte[] bytes = copyBytes(pointer, length);
+        boolean[] values = new boolean[bytes.length];
+        for (int i = 0; i < bytes.length; i++) values[i] = bytes[i] != 0;
+        return values;
+    }
+
+    static short[] copyShorts(PointerBase pointer, long length) {
+        short[] values = new short[checkedLength(length, 2)];
+        if (length != 0) CTypeConversion.asByteBuffer(pointer, values.length * 2).order(java.nio.ByteOrder.nativeOrder()).asShortBuffer().get(values);
+        return values;
+    }
+
+    static int[] copyInts(PointerBase pointer, long length) {
+        int[] values = new int[checkedLength(length, 4)];
+        if (length != 0) CTypeConversion.asByteBuffer(pointer, values.length * 4).order(java.nio.ByteOrder.nativeOrder()).asIntBuffer().get(values);
+        return values;
+    }
+
+    static long[] copyLongs(PointerBase pointer, long length) {
+        long[] values = new long[checkedLength(length, 8)];
+        if (length != 0) CTypeConversion.asByteBuffer(pointer, values.length * 8).order(java.nio.ByteOrder.nativeOrder()).asLongBuffer().get(values);
+        return values;
+    }
+
+    static float[] copyFloats(PointerBase pointer, long length) {
+        float[] values = new float[checkedLength(length, 4)];
+        if (length != 0) CTypeConversion.asByteBuffer(pointer, values.length * 4).order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer().get(values);
+        return values;
+    }
+
+    static double[] copyDoubles(PointerBase pointer, long length) {
+        double[] values = new double[checkedLength(length, 8)];
+        if (length != 0) CTypeConversion.asByteBuffer(pointer, values.length * 8).order(java.nio.ByteOrder.nativeOrder()).asDoubleBuffer().get(values);
+        return values;
+    }
+
+    private static int checkedLength(long length, int width) {
+        if (length < 0 || length > Integer.MAX_VALUE / width) {
+            throw new RuntimeException("BoltFFI vector argument too large for Java array");
+        }
+        return (int) length;
+    }
+
+    /** Returns the byte length of a stream batch buffer holding `maxCount` items. */
+    static int checkedBatchBytes(long maxCount, int itemSize) {
+        if (maxCount < 0) {
+            throw new IllegalArgumentException("BoltFFI stream batch size was negative");
+        }
+        if (maxCount > Integer.MAX_VALUE / itemSize) {
+            throw new RuntimeException("BoltFFI stream batch allocation is too large");
+        }
+        return (int) maxCount * itemSize;
+    }
+
+    static byte[] copyRecord(PointerBase pointer, int size) {
+        return copyBytes(pointer, size);
+    }
+
+    static void checkRecordLength(byte[] value, int size) {
+        if (value == null || value.length != size) {
+            throw new IllegalArgumentException("BoltFFI record byte array length did not match the C record size");
+        }
+    }
+
+    static void writeRecord(PointerBase pointer, byte[] value, int size) {
+        if (value == null || value.length != size) {
+            throw new IllegalArgumentException("BoltFFI record byte array length did not match the C record size");
+        }
+        CTypeConversion.asByteBuffer(pointer, size).put(value);
+    }
+
+    /** Copies Java bytes into a Rust-owned buffer at `out`. */
+    static void writeBuffer(FfiBuf out, byte[] value) {
+        if (value == null) {
+            throw new RuntimeException("BoltFFI byte array return was null");
+        }
+        if (value.length == 0) {
+            zeroBuffer(out);
+            return;
+        }
+        try (PinnedObject pin = PinnedObject.create(value)) {
+            Lib.boltffi_ni_boltffi_buf_from_bytes(pin.addressOfArrayElement(0), (long) value.length, out);
+        }
+    }
+
+    static void checkStatus(int code) {
+        if (code != 0) {
+            throw new RuntimeException("BoltFFI call failed");
+        }
+    }
+
+    static void checkErrorBuffer(FfiBuf error) {
+        if (error.ptr().isNonNull() || error.len() != 0) {
+            throw new BoltFfiErrorBufferException(takeBuffer(error));
+        }
+    }
+
+    /** Direct declarations of the C ABI (or its pointer-ABI shims). */
+    static final class Lib {
+        private Lib() {}
+
+        @CFunction(transition = CFunction.Transition.NO_TRANSITION)
+        static native void boltffi_ni_boltffi_free_buf(org.graalvm.word.PointerBase buf);
+
+        @CFunction(transition = CFunction.Transition.NO_TRANSITION)
+        static native void boltffi_ni_boltffi_buf_from_bytes(org.graalvm.word.PointerBase ptr, long len, org.graalvm.word.PointerBase __out);
+
+        @CFunction(transition = CFunction.Transition.NO_TRANSITION)
+        static native org.graalvm.word.PointerBase boltffi_ni_continuation_callback();
+
+        @CFunction
+        static native void boltffi_release_class_demo_engine(long handle);
+
+        @CFunction
+        static native long boltffi_stream_demo_engine_points_subscribe(long receiver);
+
+        @CFunction
+        static native int boltffi_stream_demo_engine_points_wait(long subscription, int timeout_milliseconds);
+
+        @CFunction
+        static native void boltffi_stream_demo_engine_points_poll(long subscription, long callback_data, org.graalvm.word.PointerBase callback);
+
+        @CFunction
+        static native void boltffi_stream_demo_engine_points_unsubscribe(long subscription);
+
+        @CFunction
+        static native void boltffi_stream_demo_engine_points_free(long subscription);
+
+        @CFunction
+        static native long boltffi_stream_demo_engine_points_pop_batch(long subscription, org.graalvm.word.PointerBase output_ptr, long output_capacity);
+
+        @CFunction
+        static native long boltffi_stream_demo_engine_names_subscribe(long receiver);
+
+        @CFunction
+        static native void boltffi_ni_boltffi_stream_demo_engine_names_pop_batch(long subscription, long max_count, org.graalvm.word.PointerBase __out);
+
+        @CFunction
+        static native int boltffi_stream_demo_engine_names_wait(long subscription, int timeout_milliseconds);
+
+        @CFunction
+        static native void boltffi_stream_demo_engine_names_poll(long subscription, long callback_data, org.graalvm.word.PointerBase callback);
+
+        @CFunction
+        static native void boltffi_stream_demo_engine_names_unsubscribe(long subscription);
+
+        @CFunction
+        static native void boltffi_stream_demo_engine_names_free(long subscription);
+    }
+
+    static void boltffi_release_class_demo_engine(long handle) {
+        Lib.boltffi_release_class_demo_engine(handle);
+    }
+
+    static long boltffi_stream_demo_engine_points_subscribe(long receiver) {
+        return Lib.boltffi_stream_demo_engine_points_subscribe(receiver);
+    }
+
+    static int boltffi_stream_demo_engine_points_wait(long subscription, int timeout_milliseconds) {
+        return Lib.boltffi_stream_demo_engine_points_wait(subscription, timeout_milliseconds);
+    }
+
+    static void boltffi_stream_demo_engine_points_poll(long subscription, long callback_data) {
+        Lib.boltffi_stream_demo_engine_points_poll(subscription, newHandleCell(callback_data), Lib.boltffi_ni_continuation_callback());
+    }
+
+    static void boltffi_stream_demo_engine_points_unsubscribe(long subscription) {
+        Lib.boltffi_stream_demo_engine_points_unsubscribe(subscription);
+    }
+
+    static void boltffi_stream_demo_engine_points_free(long subscription) {
+        Lib.boltffi_stream_demo_engine_points_free(subscription);
+    }
+
+    static byte[] boltffi_stream_demo_engine_points_pop_batch(long subscription, long maxCount) {
+        byte[] __items = new byte[checkedBatchBytes(maxCount, 16)];
+        long __count;
+        if (__items.length == 0) {
+            __count = Lib.boltffi_stream_demo_engine_points_pop_batch(subscription, WordFactory.nullPointer(), maxCount);
+        } else {
+            try (PinnedObject __pin_items = PinnedObject.create(__items)) {
+                __count = Lib.boltffi_stream_demo_engine_points_pop_batch(subscription, __pin_items.addressOfArrayElement(0), maxCount);
+            }
+        }
+        if (__count > maxCount) {
+            throw new RuntimeException("BoltFFI stream returned more items than requested");
+        }
+        return java.util.Arrays.copyOf(__items, (int) (__count * 16L));
+    }
+
+    static long boltffi_stream_demo_engine_names_subscribe(long receiver) {
+        return Lib.boltffi_stream_demo_engine_names_subscribe(receiver);
+    }
+
+    static byte[] boltffi_stream_demo_engine_names_pop_batch(long subscription, long max_count) {
+        FfiBuf __result_buffer = StackValue.get(FfiBuf.class);
+        zeroBuffer(__result_buffer);
+        Lib.boltffi_ni_boltffi_stream_demo_engine_names_pop_batch(subscription, max_count, __result_buffer);
+        return takeBuffer(__result_buffer);
+    }
+
+    static int boltffi_stream_demo_engine_names_wait(long subscription, int timeout_milliseconds) {
+        return Lib.boltffi_stream_demo_engine_names_wait(subscription, timeout_milliseconds);
+    }
+
+    static void boltffi_stream_demo_engine_names_poll(long subscription, long callback_data) {
+        Lib.boltffi_stream_demo_engine_names_poll(subscription, newHandleCell(callback_data), Lib.boltffi_ni_continuation_callback());
+    }
+
+    static void boltffi_stream_demo_engine_names_unsubscribe(long subscription) {
+        Lib.boltffi_stream_demo_engine_names_unsubscribe(subscription);
+    }
+
+    static void boltffi_stream_demo_engine_names_free(long subscription) {
+        Lib.boltffi_stream_demo_engine_names_free(subscription);
+    }
+
+    @CEntryPoint(name = "boltffi_ni_java_continuation")
+    @com.oracle.svm.guest.staging.c.function.CEntryPointOptions(prologue = AttachPrologue.class)
+    static void boltffi_ni_continuation(HandleCell __cell, byte pollResult) {
+        long __token = __cell.token();
+        UnmanagedMemory.free(__cell);
+        try {
+            Native.boltffiFutureContinuationCallback(__token, pollResult);
+        } catch (Throwable __failure) {
+            // A resumed future owns its own failure reporting.
+        }
+    }
+}
+===== native_image/native_image_glue.c =====
+// Generated by BoltFFI. Pointer-ABI shims for GraalVM Native Image @CFunction calls and @CEntryPoint upcalls.
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+#include "demo.h"
+#include "native_image_glue.h"
+
+void boltffi_ni_boltffi_free_buf(const FfiBuf_u8 *buf) {
+    boltffi_free_buf(*buf);
+}
+
+void boltffi_ni_boltffi_buf_from_bytes(const uint8_t *ptr, uintptr_t len, FfiBuf_u8 *__out) {
+    *__out = boltffi_buf_from_bytes(ptr, len);
+}
+
+void boltffi_ni_boltffi_stream_demo_engine_names_pop_batch(uint64_t subscription, uintptr_t max_count, FfiBuf_u8 *__out) {
+    *__out = boltffi_stream_demo_engine_names_pop_batch(subscription, max_count);
+}
+
+extern void boltffi_ni_java_continuation(BoltFFINativeImageHandleCell *cell, int8_t poll_result);
+static void boltffi_ni_continuation_shim(uint64_t callback_data, int8_t poll_result) {
+    boltffi_ni_java_continuation((BoltFFINativeImageHandleCell *)(uintptr_t)callback_data, poll_result);
+}
+
+void *boltffi_ni_continuation_callback(void) {
+    return (void *)boltffi_ni_continuation_shim;
+}

@@ -181,6 +181,19 @@ impl NativeImageContract {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
+        for stream in jvm.streams() {
+            for method in stream.methods() {
+                downcalls.push(Downcall::from_native_method(
+                    method,
+                    transition,
+                    c_bridge.callbacks(),
+                    &closures,
+                )?);
+            }
+            for batch in stream.direct_batches() {
+                downcalls.push(Downcall::direct_batch(batch, transition)?);
+            }
+        }
         for registration in jvm.callbacks() {
             for method in registration.handle_methods() {
                 downcalls.push(Downcall::from_handle_method(

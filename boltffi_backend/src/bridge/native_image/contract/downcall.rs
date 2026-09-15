@@ -16,9 +16,9 @@ use crate::{
         c::{self, Identifier},
         jni::{
             BytesParameter, CallbackHandleLifecycle, CallbackHandleMethod,
-            ClosureParameter as JniClosureParameter, DirectVectorParameter, JniType, NativeMethod,
-            NativeParameter, NativeParameterKind, NativeReturn, RecordParameter, SuccessOutReturn,
-            SuccessOutValue, SuccessOutWriter,
+            ClosureParameter as JniClosureParameter, DirectStreamBatchMethod,
+            DirectVectorParameter, JniType, NativeMethod, NativeParameter, NativeParameterKind,
+            NativeReturn, RecordParameter, SuccessOutReturn, SuccessOutValue, SuccessOutWriter,
         },
     },
     core::{Error, Result},
@@ -401,6 +401,53 @@ impl Downcall {
         }
         .build()?;
         downcall.wrapper = Some(wrapper);
+        Ok(downcall)
+    }
+
+    /// Builds the wrapper for a direct stream batch, which fills a Java array in place.
+    ///
+    /// The C bridge writes items into caller-owned storage and returns how many
+    /// it wrote, so the wrapper pins a byte array large enough for the requested
+    /// count and trims it to the used prefix.
+    pub(super) fn direct_batch(
+        batch: &DirectStreamBatchMethod,
+        transition: Transition,
+    ) -> Result<Self> {
+        let mut downcall = Self::from_c_function(batch.c_function(), transition)?;
+        let subscription = match downcall.lib_params.first().map(LibParameter::ty) {
+            Some(JavaCType::Pointer) => "WordFactory.pointer(subscription)".to_owned(),
+            _ => "subscription".to_owned(),
+        };
+        let lib = downcall.lib_name.as_str().to_owned();
+        let size = batch.item_size();
+        downcall.wrapper = Some(Wrapper {
+            name: batch.c_function().name().to_owned(),
+            params: vec![
+                WrapperParameter::new("subscription", "long"),
+                WrapperParameter::new("maxCount", "long"),
+            ],
+            returns: "byte[]".to_owned(),
+            body: vec![
+                format!("byte[] __items = new byte[checkedBatchBytes(maxCount, {size})];"),
+                "long __count;".to_owned(),
+                "if (__items.length == 0) {".to_owned(),
+                format!(
+                    "    __count = Lib.{lib}({subscription}, WordFactory.nullPointer(), maxCount);"
+                ),
+                "} else {".to_owned(),
+                "    try (PinnedObject __pin_items = PinnedObject.create(__items)) {".to_owned(),
+                format!(
+                    "        __count = Lib.{lib}({subscription}, __pin_items.addressOfArrayElement(0), maxCount);"
+                ),
+                "    }".to_owned(),
+                "}".to_owned(),
+                "if (__count > maxCount) {".to_owned(),
+                "    throw new RuntimeException(\"BoltFFI stream returned more items than requested\");"
+                    .to_owned(),
+                "}".to_owned(),
+                format!("return java.util.Arrays.copyOf(__items, (int) (__count * {size}L));"),
+            ],
+        });
         Ok(downcall)
     }
 
