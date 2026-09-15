@@ -18,9 +18,9 @@ pub use csharp::CSharpConfig;
 #[cfg(test)]
 pub use csharp::CSharpNugetConfig;
 pub use dart::DartConfig;
-pub use java::JavaConfig;
 #[cfg(test)]
 pub use java::JavaJvmConfig;
+pub use java::{JavaConfig, JavaJvmBinding};
 pub use kmp::KotlinMultiplatformConfig;
 pub use kotlin::{
     AndroidConfig, AndroidLinkConfig, AndroidPackConfig, KotlinApiStyle, KotlinConfig,

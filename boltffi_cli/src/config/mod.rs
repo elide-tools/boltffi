@@ -17,10 +17,10 @@ pub use experimental::Experimental;
 pub use symbols::{DebugSymbolsBundle, DebugSymbolsConfig, DebugSymbolsFormat};
 pub use targets::{
     AndroidConfig, AndroidLinkConfig, AndroidPackConfig, AppleConfig, CConfig, CSharpConfig,
-    DartConfig, HeaderConfig, JavaConfig, KotlinApiStyle, KotlinConfig, KotlinDesktopLoader,
-    KotlinFactoryStyle, KotlinMultiplatformConfig, PythonConfig, SpmConfig, SpmDistribution,
-    SpmLayout, SwiftConfig, TargetsConfig, WasmConfig, WasmNpmTarget, WasmOptimizeLevel,
-    WasmOptimizeOnMissing, WasmProfile, XcframeworkConfig,
+    DartConfig, HeaderConfig, JavaConfig, JavaJvmBinding, KotlinApiStyle, KotlinConfig,
+    KotlinDesktopLoader, KotlinFactoryStyle, KotlinMultiplatformConfig, PythonConfig, SpmConfig,
+    SpmDistribution, SpmLayout, SwiftConfig, TargetsConfig, WasmConfig, WasmNpmTarget,
+    WasmOptimizeLevel, WasmOptimizeOnMissing, WasmProfile, XcframeworkConfig,
 };
 #[cfg(test)]
 pub use targets::{CSharpNugetConfig, JavaJvmConfig, PythonWheelConfig};
@@ -840,6 +840,10 @@ impl Config {
 
     pub fn java_jvm_strip_symbols(&self) -> bool {
         self.targets.java.jvm.strip_symbols
+    }
+
+    pub fn java_jvm_binding(&self) -> JavaJvmBinding {
+        self.targets.java.jvm.binding
     }
 
     pub fn java_jvm_debug_symbols_enabled(&self) -> bool {
@@ -1820,6 +1824,53 @@ host_targets = ["current", "darwin-aarch64", "linux-x86-64", "windows-x86-64"]
                 .collect::<Vec<_>>(),
             vec!["current", "darwin-arm64", "linux-x86_64", "windows-x86_64"]
         );
+    }
+
+    #[test]
+    fn defaults_java_jvm_binding_to_jni() {
+        let config = parse_config(
+            r#"
+[package]
+name = "mylib"
+
+[targets.java.jvm]
+enabled = true
+"#,
+        );
+
+        assert_eq!(config.java_jvm_binding(), JavaJvmBinding::Jni);
+    }
+
+    #[test]
+    fn parses_java_jvm_binding_jni() {
+        let config = parse_config(
+            r#"
+[package]
+name = "mylib"
+
+[targets.java.jvm]
+enabled = true
+binding = "jni"
+"#,
+        );
+
+        assert_eq!(config.java_jvm_binding(), JavaJvmBinding::Jni);
+    }
+
+    #[test]
+    fn parses_java_jvm_binding_native_image() {
+        let config = parse_config(
+            r#"
+[package]
+name = "mylib"
+
+[targets.java.jvm]
+enabled = true
+binding = "native-image"
+"#,
+        );
+
+        assert_eq!(config.java_jvm_binding(), JavaJvmBinding::NativeImage);
     }
 
     #[test]

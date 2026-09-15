@@ -9,12 +9,12 @@ use crate::cli::{CliError, Result};
 use crate::commands::generate::java::TargetGeneration;
 use crate::commands::generate::run_generate_java_with_generations;
 use crate::commands::pack::{PackExecutionOptions, PackJavaOptions};
-use crate::config::{Config, DebugSymbolsBundle, DebugSymbolsFormat};
-use crate::pack::resolve_build_cargo_args;
+use crate::config::{Config, DebugSymbolsBundle, DebugSymbolsFormat, JavaJvmBinding};
 use crate::pack::symbols::{
     DebugSymbolArtifact, DebugSymbolArtifactKind, ensure_debug_symbols_profile_has_debuginfo,
     write_debug_symbols_zip,
 };
+use crate::pack::{print_verbose_detail, resolve_build_cargo_args};
 use crate::reporter::Reporter;
 use crate::target::JavaHostTarget;
 use crate::toolchain::NativeHostToolchain;
@@ -22,6 +22,9 @@ use crate::toolchain::NativeHostToolchain;
 use super::link::{
     build_jvm_native_library, compile_jni_library, resolve_jni_include_directories,
     validate_desktop_jni_symbol_stripping_for,
+};
+use super::native_image::{
+    NativeImageOutputLayout, build_native_image_native_library, write_native_image_properties,
 };
 use super::outputs::{
     remove_stale_flat_jvm_outputs_if_current_host_unrequested,
@@ -175,6 +178,37 @@ fn execute_java_pack(config: &Config, plan: JavaPackPlan, reporter: &Reporter) -
         step.finish_success();
     }
 
+    let artifact_name = selected_jvm_package_artifact_name(&packaging_targets)?.to_string();
+
+    match config.java_jvm_binding() {
+        JavaJvmBinding::Jni => execute_java_pack_jni(
+            config,
+            &execution,
+            &host_targets,
+            &packaging_targets,
+            &expansion,
+            &artifact_name,
+            reporter,
+        ),
+        JavaJvmBinding::NativeImage => execute_java_pack_native_image(
+            config,
+            &packaging_targets,
+            &expansion,
+            &artifact_name,
+            reporter,
+        ),
+    }
+}
+
+fn execute_java_pack_jni(
+    config: &Config,
+    execution: &PackExecutionOptions,
+    host_targets: &[JavaHostTarget],
+    packaging_targets: &[JvmPackagingTarget],
+    expansion: &BindingExpansion,
+    artifact_name: &str,
+    reporter: &Reporter,
+) -> Result<()> {
     let packaged_outputs = packaging_targets
         .iter()
         .map(|packaging_target| {
@@ -186,7 +220,7 @@ fn execute_java_pack(config: &Config, plan: JavaPackPlan, reporter: &Reporter) -
             let build_artifacts = build_jvm_native_library(
                 packaging_target,
                 execution.release,
-                Some(&expansion),
+                Some(expansion),
                 &step,
             )?;
             step.finish_success();
@@ -201,7 +235,6 @@ fn execute_java_pack(config: &Config, plan: JavaPackPlan, reporter: &Reporter) -
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let artifact_name = selected_jvm_package_artifact_name(&packaging_targets)?;
     if config.java_jvm_debug_symbols_archive_enabled() {
         let step = reporter.step("Bundling JVM debug symbols");
         write_jvm_debug_symbols(config, artifact_name, &packaged_outputs)?;
@@ -212,13 +245,78 @@ fn execute_java_pack(config: &Config, plan: JavaPackPlan, reporter: &Reporter) -
         &packaged_outputs,
         artifact_name,
     )?;
-    remove_stale_structured_jvm_outputs(&config.java_jvm_output().join("native"), &host_targets)?;
+    remove_stale_structured_jvm_outputs(&config.java_jvm_output().join("native"), host_targets)?;
     remove_stale_flat_jvm_outputs_if_current_host_unrequested(
         &config.java_jvm_output(),
         JavaHostTarget::current(),
-        &host_targets,
+        host_targets,
         artifact_name,
     )?;
+
+    reporter.finish();
+    Ok(())
+}
+
+/// Packages the Native Image static archive: no JNI shared library, strip
+/// step, or debug-symbol archive. Builds the Rust staticlib, compiles and
+/// appends the pointer-ABI glue shim, copies the generated headers, and
+/// writes `native-image.properties`.
+fn execute_java_pack_native_image(
+    config: &Config,
+    packaging_targets: &[JvmPackagingTarget],
+    expansion: &BindingExpansion,
+    artifact_name: &str,
+    reporter: &Reporter,
+) -> Result<()> {
+    for packaging_target in packaging_targets {
+        let host_target = packaging_target.cargo_context.host_target;
+        let release = packaging_target.cargo_context.release;
+
+        let step = reporter.step(&format!(
+            "Building Rust staticlib for {}",
+            host_target.canonical_name()
+        ));
+        let build_artifacts =
+            build_jvm_native_library(packaging_target, release, Some(expansion), &step)?;
+        step.finish_success();
+
+        let step = reporter.step(&format!(
+            "Packaging Native Image static archive for {}",
+            host_target.canonical_name()
+        ));
+        let output =
+            build_native_image_native_library(config, packaging_target, &build_artifacts, &step)?;
+        if step.is_verbose() {
+            print_verbose_detail(&format!(
+                "native-image outputs for {}: archive={}, header={}, glue_header={}",
+                output.host_target.canonical_name(),
+                output.archive_path.display(),
+                output.header_path.display(),
+                output.glue_header_path.display()
+            ));
+        }
+        step.finish_success_with(&format!(
+            "Packaged Native Image static archive for {}: {}",
+            output.host_target.canonical_name(),
+            output.archive_path.display()
+        ));
+    }
+
+    let current_host = JavaHostTarget::current().ok_or_else(|| CliError::CommandFailed {
+        command:
+            "JVM packaging is only supported on darwin-arm64, darwin-x86_64, linux-x86_64, linux-aarch64, and windows-x86_64 hosts".to_string(),
+        status: None,
+    })?;
+
+    let step = reporter.step("Writing native-image.properties");
+    let layout = NativeImageOutputLayout::resolve(
+        &config.java_jvm_output(),
+        &config.java_package(),
+        artifact_name,
+        current_host,
+    )?;
+    write_native_image_properties(&layout)?;
+    step.finish_success();
 
     reporter.finish();
     Ok(())
@@ -239,21 +337,40 @@ fn prepare_java_packaging(
         command_name,
         binding_expansion,
     )?;
-    if config.java_jvm_debug_symbols_enabled() {
-        let build_cargo_args = resolve_build_cargo_args(config, cargo_args);
-        ensure_debug_symbols_profile_has_debuginfo(
-            &build_cargo_args,
-            &prepared.packaging_targets[0].cargo_context.build_profile,
-            "targets.java.jvm.debug_symbols",
-            &prepared
-                .packaging_targets
-                .iter()
-                .map(|target| target.cargo_context.rust_target_triple.clone())
-                .collect::<Vec<_>>(),
-        )?;
+
+    match config.java_jvm_binding() {
+        JavaJvmBinding::Jni => {
+            if config.java_jvm_debug_symbols_enabled() {
+                let build_cargo_args = resolve_build_cargo_args(config, cargo_args);
+                ensure_debug_symbols_profile_has_debuginfo(
+                    &build_cargo_args,
+                    &prepared.packaging_targets[0].cargo_context.build_profile,
+                    "targets.java.jvm.debug_symbols",
+                    &prepared
+                        .packaging_targets
+                        .iter()
+                        .map(|target| target.cargo_context.rust_target_triple.clone())
+                        .collect::<Vec<_>>(),
+                )?;
+            }
+        }
+        JavaJvmBinding::NativeImage => {
+            ensure_native_image_single_host_target(&prepared.host_targets)?;
+        }
     }
 
     Ok(prepared)
+}
+
+fn ensure_native_image_single_host_target(host_targets: &[JavaHostTarget]) -> Result<()> {
+    if host_targets.len() > 1 {
+        return Err(CliError::CommandFailed {
+            command: "targets.java.jvm.binding = \"native-image\" packages a single static archive under dist/java/native; set targets.java.jvm.host_targets to a single host".to_string(),
+            status: None,
+        });
+    }
+
+    Ok(())
 }
 
 pub(crate) fn prepare_kmp_jvm_packaging(
@@ -542,8 +659,8 @@ mod tests {
 
     use super::{
         ensure_java_ir_regeneration, ensure_java_no_build_supported,
-        ensure_jvm_pack_cargo_args_supported, resolve_jvm_packaging_targets,
-        write_jvm_debug_symbols,
+        ensure_jvm_pack_cargo_args_supported, ensure_native_image_single_host_target,
+        resolve_jvm_packaging_targets, write_jvm_debug_symbols,
     };
     use crate::build::CargoBuildProfile;
     use crate::cli::CliError;
@@ -691,6 +808,28 @@ mod tests {
                 if command.contains("pack java requires regenerated bindings")
         ));
         ensure_java_ir_regeneration(true).expect("regenerated Binding IR packaging should proceed");
+    }
+
+    #[test]
+    fn native_image_binding_rejects_multiple_host_targets() {
+        let error = ensure_native_image_single_host_target(&[
+            JavaHostTarget::DarwinArm64,
+            JavaHostTarget::LinuxX86_64,
+        ])
+        .expect_err("expected multi-host native-image packaging to be rejected");
+
+        assert!(matches!(
+            error,
+            CliError::CommandFailed { command, status: None }
+                if command.contains("binding = \"native-image\"")
+                    && command.contains("targets.java.jvm.host_targets")
+        ));
+    }
+
+    #[test]
+    fn native_image_binding_allows_a_single_host_target() {
+        ensure_native_image_single_host_target(&[JavaHostTarget::DarwinArm64])
+            .expect("single host target should be accepted");
     }
 
     #[test]

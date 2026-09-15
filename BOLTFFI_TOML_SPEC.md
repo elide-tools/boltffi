@@ -290,6 +290,23 @@ Desktop JVM target configuration.
   - Phase 3 behavior: all configured values must resolve to the current host target after `current` expansion and deduping
   - Packaging layout: `boltffi pack java` writes the JNI library to `dist/java/native/<host-target>/` and also keeps a flat current-host `_jni` copy in `dist/java/`
   - `boltffi pack java --no-build` is unsupported in Phase 3; rerun without `--no-build`
+- `binding` (`jni` | `native-image`): How the generated Java host reaches the C ABI, and correspondingly how `boltffi pack java` stages native outputs.
+  - Default: `jni`
+  - `jni`: JNI glue compiled as a shared library and loaded with `System.loadLibrary` (the behavior described above).
+  - `native-image`: GraalVM Native Image C API, statically linked into the image. Requires GraalVM 25 or newer.
+    - Requires the selected crate to build a `staticlib` (`crate-type = ["staticlib"]` in `[lib]`); `boltffi pack java` fails clearly if it does not.
+    - `host_targets` must resolve to exactly one host in this mode: Native Image builds for the host running `native-image`, not a cross-compilation matrix.
+    - `boltffi pack java` builds the Rust staticlib, compiles the generated `native_image/native_image_glue.c` pointer-ABI shim to an object file, and appends it (`ar rcs`, or `lib.exe` on MSVC) to a copy of the Rust staticlib so the result is one archive: `dist/java/native/lib<artifact>.a` (`dist/java/native/<artifact>.lib` on Windows, where `<artifact>` is the Cargo artifact name via `NativeLibraries::from_artifact`, matching the `@CLibrary(requireStatic = true)` value the generated Java expects).
+    - Also copies the generated `boltffi.h` and `native_image_glue.h` headers into `dist/java/native/`.
+    - Writes `dist/java/META-INF/native-image/<java-package>/<artifact>/native-image.properties` (picked up automatically from the classpath by `native-image`) with:
+      ```
+      Args = -H:CLibraryPath=${.}/../../../../native \
+             -Dboltffi.include=${.}/../../../../native \
+             --add-exports org.graalvm.nativeimage.guest.staging/com.oracle.svm.guest.staging.c.function=ALL-UNNAMED \
+             --add-exports org.graalvm.nativeimage.guest.staging/com.oracle.svm.guest.staging.c=ALL-UNNAMED \
+             --add-exports org.graalvm.nativeimage.shared/com.oracle.svm.shared=ALL-UNNAMED
+      ```
+    - Emits no JNI glue, no JNI shared library, and skips the strip and debug-symbol steps described above.
 
 ### `[targets.java.jvm.debug_symbols]` (optional)
 

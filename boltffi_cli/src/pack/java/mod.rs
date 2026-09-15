@@ -1,4 +1,5 @@
 pub(crate) mod link;
+pub(crate) mod native_image;
 pub(crate) mod outputs;
 pub(crate) mod plan;
 
