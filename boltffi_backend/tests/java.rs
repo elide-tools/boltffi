@@ -8,7 +8,7 @@ use std::{
 use boltffi_ast::PackageInfo;
 use boltffi_backend::{
     CoverageMode, DeclarationLabel, Error,
-    target::java::{JavaDesktopLoader, JavaHost, JavaVersion},
+    target::java::{JavaDesktopLoader, JavaHost, JavaVersion, JvmBinding},
 };
 use boltffi_binding::{DeclarationRef, Native, lower};
 
@@ -3229,4 +3229,35 @@ fn temporary_directory(prefix: &str) -> PathBuf {
         .expect("system time after epoch")
         .as_nanos();
     std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()))
+}
+
+#[test]
+fn java_native_image_primitive_function_stack() {
+    let output = render_with_host(
+        PRIMITIVE_FUNCTIONS,
+        CoverageMode::Complete,
+        host().binding(JvmBinding::NativeImage),
+    );
+    let demo = java_source(&output, "com.boltffi.demo", "Demo");
+    assert!(!demo.contains("final class Native"));
+    assert!(!demo.contains("System.loadLibrary"));
+    assert!(!demo.contains("static native"));
+    assert!(demo.contains("BoltFFINativeImage.boltffi_function_demo_carriers("));
+    let native_image = java_source(&output, "com.boltffi.demo", "BoltFFINativeImage");
+    assert!(native_image.contains("@CLibrary(value = \"boltffi\", requireStatic = true)"));
+    assert!(
+        native_image.contains("static native boolean boltffi_function_demo_enabled(boolean flag);")
+    );
+    assert!(output.files().iter().any(|file| {
+        file.path()
+            .as_path()
+            .ends_with("native_image/native_image_glue.c")
+    }));
+    assert!(
+        !output
+            .files()
+            .iter()
+            .any(|file| file.path().as_path().ends_with("BoltFFINativeRuntime.java"))
+    );
+    insta::assert_snapshot!(demo);
 }

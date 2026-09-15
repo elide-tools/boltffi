@@ -1,0 +1,21 @@
+---
+source: boltffi_backend/tests/java.rs
+expression: demo
+---
+package com.boltffi.demo;
+
+public final class Demo {
+    private Demo() {}
+
+    public static long carriers(boolean flag, byte signedByte, byte unsignedByte, short signedShort, short unsignedShort, int signedWord, int unsignedWord, long signedWide, long unsignedWide, long signedSize, long unsignedSize, float single, double _double) {
+        return BoltFFINativeImage.boltffi_function_demo_carriers(flag, signedByte, unsignedByte, signedShort, unsignedShort, signedWord, unsignedWord, signedWide, unsignedWide, signedSize, unsignedSize, single, _double);
+    }
+
+    public static boolean enabled(boolean flag) {
+        return BoltFFINativeImage.boltffi_function_demo_enabled(flag);
+    }
+
+    public static void refresh() {
+        BoltFFINativeImage.boltffi_function_demo_refresh();
+    }
+}

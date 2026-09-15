@@ -20,6 +20,7 @@ use crate::{
     bridge::{
         c::CBridge,
         jni::{BridgeOwner, JniBridge, JniBridgeContract},
+        native_image::NativeImageBridge,
     },
     core::{
         BindingCapability, BridgeCapability, BridgeLayer, CapabilityRequirements, CoverageMode,
@@ -112,6 +113,9 @@ impl JavaHost {
             self.native_libraries = self
                 .native_libraries
                 .with_desktop_loader(JavaDesktopLoader::None);
+            if self.c_header == PathBuf::from("jni/boltffi.h") {
+                self.c_header = PathBuf::from("native_image/boltffi.h");
+            }
         }
         self
     }
@@ -185,22 +189,39 @@ impl JavaHost {
         ))
     }
 
+    fn native_image_target(&self) -> Result<Target<Self, BridgeLayer<CBridge, NativeImageBridge>>> {
+        self.validate_version(self.java_version)?;
+        let c_bridge = CBridge::new(self.c_header.clone())?;
+        let bridge = NativeImageBridge::for_host(
+            &self.package.to_string(),
+            self.native_libraries.desktop_fallback().as_str(),
+        )?;
+        Ok(Target::new(
+            self.clone(),
+            BridgeLayer::new(c_bridge, bridge),
+        ))
+    }
+
     /// Renders Java bindings with the requested coverage policy.
     pub fn render_with_coverage(
         &self,
         bindings: &Bindings<Native>,
         mode: crate::core::CoverageMode,
     ) -> Result<GeneratedOutput> {
-        if matches!(self.binding, JvmBinding::NativeImage) {
-            return Err(Self::unsupported("native image binding"));
-        }
-        match mode {
-            CoverageMode::Complete => self.target()?.render(bindings),
-            CoverageMode::Partial => {
+        match (mode, self.binding) {
+            (CoverageMode::Complete, JvmBinding::Jni) => self.target()?.render(bindings),
+            (CoverageMode::Complete, JvmBinding::NativeImage) => {
+                self.native_image_target()?.render(bindings)
+            }
+            (CoverageMode::Partial, binding) => {
                 let (bindings, coverage) = admission::Selection::new(self, bindings)?.into_parts();
-                self.target()?
-                    .render_partial(&bindings)
-                    .map(|output| output.with_coverage(coverage))
+                match binding {
+                    JvmBinding::Jni => self.target()?.render_partial(&bindings),
+                    JvmBinding::NativeImage => {
+                        self.native_image_target()?.render_partial(&bindings)
+                    }
+                }
+                .map(|output| output.with_coverage(coverage))
             }
         }
     }
