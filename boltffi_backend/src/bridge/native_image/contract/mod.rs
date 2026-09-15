@@ -5,6 +5,7 @@
 //! native image: which `@CFunction` to declare, whether a pointer-ABI shim is
 //! needed, and which thread transition the call uses.
 
+mod asynchronous;
 mod closure;
 mod downcall;
 mod java_type;
@@ -25,6 +26,7 @@ pub use downcall::{Downcall, LibParameter, Transition, Wrapper, WrapperParameter
 
 /// Glue function that registers every callback vtable with Rust.
 pub const REGISTER_CALLBACKS: &str = "boltffi_ni_register_callbacks";
+pub use asynchronous::{CompletionCall, CompletionUpcall};
 pub use closure::ClosureUpcall;
 pub use java_type::JavaCType;
 pub use shim::ShimFunction;
@@ -50,6 +52,8 @@ pub struct NativeImageContract {
     buffer_from_bytes: String,
     callbacks: Vec<CallbackUpcall>,
     closures: Vec<ClosureUpcall>,
+    completions: Vec<CompletionUpcall>,
+    continuation: Option<Trampoline>,
     glue_header_file: String,
 }
 
@@ -84,6 +88,18 @@ impl NativeImageContract {
                     .and_then(|function| Downcall::from_c_function(&function, transition))
             })
             .transpose()?;
+        let completions = jvm
+            .callback_completions()
+            .iter()
+            .map(CompletionUpcall::new)
+            .collect::<Result<Vec<_>>>()?;
+        let needs_continuation = jvm.methods().iter().any(|method| {
+            method
+                .c_function()
+                .parameter_groups()
+                .iter()
+                .any(|group| matches!(group, c::ParameterGroup::Continuation(_)))
+        }) || !jvm.streams().is_empty();
         let shapes = closure_shapes(c_bridge)?;
         let closures = jvm
             .closures()
@@ -109,8 +125,40 @@ impl NativeImageContract {
                 )
                 .and_then(|function| Downcall::from_c_function(&function, Transition::NoTransition))
             });
+        let continuation = needs_continuation
+            .then(|| asynchronous::continuation(jvm.class().class_name()))
+            .transpose()?;
+        let completion_downcalls =
+            completions
+                .iter()
+                .flat_map(CompletionUpcall::calls)
+                .map(|call| {
+                    Downcall::glue(
+                        call.lib_name(),
+                        call.lib_params(),
+                        JavaCType::Void,
+                        transition,
+                        Some(call.wrapper().clone()),
+                        Some(call.shim().clone()),
+                    )
+                });
+        let continuation_address = continuation
+            .as_ref()
+            .map(|_| {
+                Downcall::glue(
+                    asynchronous::CONTINUATION_ADDRESS,
+                    &[],
+                    JavaCType::Pointer,
+                    Transition::NoTransition,
+                    None,
+                    None,
+                )
+            })
+            .transpose()?;
         let mut downcalls = support
             .chain(create_handles)
+            .chain(continuation_address.map(Ok))
+            .chain(completion_downcalls)
             .chain(register_all.map(Ok))
             .chain(closure_addresses)
             .chain(jvm.methods().iter().map(|method| {
@@ -125,7 +173,12 @@ impl NativeImageContract {
             .zip(c_bridge.callbacks())
             .zip(downcalls[2..2 + c_bridge.callbacks().len()].iter())
             .map(|((registration, callback), create)| {
-                CallbackUpcall::new(registration, callback, create.lib_name().as_str())
+                CallbackUpcall::new(
+                    registration,
+                    callback,
+                    create.lib_name().as_str(),
+                    &completions,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         for registration in jvm.callbacks() {
@@ -170,6 +223,9 @@ impl NativeImageContract {
                 .iter()
                 .flat_map(|upcall| upcall.shims().iter().cloned()),
         );
+        if let Some((_, continuation_shims)) = continuation.as_ref() {
+            shims.extend(continuation_shims.iter().cloned());
+        }
         if !callbacks.is_empty() {
             let registrations = callbacks
                 .iter()
@@ -220,6 +276,8 @@ impl NativeImageContract {
             buffer_from_bytes,
             callbacks,
             closures,
+            completions,
+            continuation: continuation.map(|(trampoline, _)| trampoline),
             glue_header_file,
         })
     }
@@ -237,6 +295,16 @@ impl NativeImageContract {
     /// Returns JVM-owned closure signatures.
     pub fn closures(&self) -> &[ClosureUpcall] {
         &self.closures
+    }
+
+    /// Returns async callback completion invokers.
+    pub fn completions(&self) -> &[CompletionUpcall] {
+        &self.completions
+    }
+
+    /// Returns the shared poll continuation trampoline, when the crate polls futures.
+    pub fn continuation(&self) -> Option<&Trampoline> {
+        self.continuation.as_ref()
     }
 
     /// Returns whether any callback vtable must be registered at class init.

@@ -267,6 +267,12 @@ final class BoltFFINativeImage {
         return copyBytes(pointer, size);
     }
 
+    static void checkRecordLength(byte[] value, int size) {
+        if (value == null || value.length != size) {
+            throw new IllegalArgumentException("BoltFFI record byte array length did not match the C record size");
+        }
+    }
+
     static void writeRecord(PointerBase pointer, byte[] value, int size) {
         if (value == null || value.length != size) {
             throw new IllegalArgumentException("BoltFFI record byte array length did not match the C record size");
@@ -485,11 +491,11 @@ void boltffi_ni_boltffi_buf_from_bytes(const uint8_t *ptr, uintptr_t len, FfiBuf
     *__out = boltffi_buf_from_bytes(ptr, len);
 }
 
-void boltffi_ni_boltffi_function_demo_apply_text(FfiBuf_u8 (*)(void *, const uint8_t *, uintptr_t) callback_call, void *callback_context, void (*)(void *) callback_release, const uint8_t *value_ptr, uintptr_t value_len, FfiBuf_u8 *__out) {
+void boltffi_ni_boltffi_function_demo_apply_text(FfiBuf_u8 (*callback_call)(void *, const uint8_t *, uintptr_t), void *callback_context, void (*callback_release)(void *), const uint8_t *value_ptr, uintptr_t value_len, FfiBuf_u8 *__out) {
     *__out = boltffi_function_demo_apply_text(callback_call, callback_context, callback_release, value_ptr, value_len);
 }
 
-void boltffi_ni_boltffi_function_demo_apply_point(___Point (*)(void *, ___Point) callback_call, void *callback_context, void (*)(void *) callback_release, const ___Point *value, ___Point *__out) {
+void boltffi_ni_boltffi_function_demo_apply_point(___Point (*callback_call)(void *, ___Point), void *callback_context, void (*callback_release)(void *), const ___Point *value, ___Point *__out) {
     *__out = boltffi_function_demo_apply_point(callback_call, callback_context, callback_release, *value);
 }
 

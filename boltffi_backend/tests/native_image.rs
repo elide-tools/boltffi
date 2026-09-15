@@ -241,6 +241,7 @@ fn dump_fixture() {
         Ok("callbacks") => CALLBACKS,
         Ok("handles") => CALLBACK_HANDLES,
         Ok("closures") => CLOSURES,
+        Ok("async") => ASYNC,
         _ => PRIMITIVE_FUNCTIONS,
     };
     eprintln!("{}", rendered(source));
@@ -371,5 +372,48 @@ fn renders_closure_trampolines_and_address_accessors() {
     assert!(out.contains("ClosureI32ToResultI32ErrDemoMathErrorCallbacks.call(__cell.token(), arg0, return_out.rawValue());"));
     // the glue hands Java the forwarder addresses
     assert!(out.contains("void *boltffi_ni_closure____closure__i32_to_i32_call(void) {\n    return (void *)boltffi_ni____closure__i32_to_i32_call_shim;\n}"));
+    insta::assert_snapshot!(out);
+}
+
+const ASYNC: &str = r#"
+    #[error]
+    pub enum LoadError { Missing }
+
+    #[export]
+    pub async fn load(id: u32) -> String { format!("{id}") }
+
+    #[export]
+    pub async fn count() -> Result<u32, LoadError> { Ok(1) }
+
+    #[export]
+    pub trait Watcher {
+        async fn describe(&self, id: u32) -> String;
+        async fn total(&self) -> u32;
+    }
+
+    #[export]
+    pub fn watch(watcher: Box<dyn Watcher>) { let _ = watcher; }
+"#;
+
+#[test]
+fn renders_continuations_and_async_callback_completions() {
+    let out = rendered(ASYNC);
+    // one shared poll continuation, wrapped in a one-shot handle cell
+    assert!(out.contains("newHandleCell(callback_data), Lib.boltffi_ni_continuation_callback()"));
+    assert!(out.contains("@CEntryPoint(name = \"boltffi_ni_java_continuation\")"));
+    assert!(
+        out.contains("static void boltffi_ni_continuation(HandleCell __cell, byte pollResult) {")
+    );
+    assert!(out.contains("UnmanagedMemory.free(__cell);"));
+    assert!(out.contains("Native.boltffiFutureContinuationCallback(__token, pollResult);"));
+    assert!(out.contains("void *boltffi_ni_continuation_callback(void) {"));
+    // the poll call reports failure through bridge-owned status storage
+    assert!(out.contains("org.graalvm.nativeimage.c.type.CIntPointer __boltffi_status = StackValue.get(org.graalvm.nativeimage.c.type.CIntPointer.class);"));
+    assert!(out.contains("checkStatus(__boltffi_status.read());"));
+    // Java completes an async callback through a pointer-ABI glue shim
+    assert!(out.contains("writeBuffer(__payload, result);"));
+    assert!(out.contains("void (*__complete)(void *, FfiStatus, FfiBuf_u8) = (void (*)(void *, FfiStatus, FfiBuf_u8))__callback;"));
+    assert!(out.contains("__complete(__context, (FfiStatus){ .code = 0 }, *__payload);"));
+    assert!(out.contains("__complete(__context, (FfiStatus){ .code = 1 });"));
     insta::assert_snapshot!(out);
 }

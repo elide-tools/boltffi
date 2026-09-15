@@ -21,7 +21,8 @@ use crate::{
 
 use super::{
     super::NATIVE_IMAGE_BRIDGE,
-    JavaCType, ShimFunction,
+    CompletionUpcall, JavaCType, ShimFunction,
+    asynchronous::{completion_names, payload_suffix},
     shim::{Pointerized, c_declaration},
 };
 
@@ -111,6 +112,7 @@ impl CallbackUpcall {
         registration: &CallbackRegistration,
         callback: &c::Callback,
         create_handle_lib: &str,
+        completions: &[CompletionUpcall],
     ) -> Result<Self> {
         let stem = registration.vtable_type().as_str();
         let dispatch_class = registration.class().class_name().to_owned();
@@ -182,7 +184,7 @@ impl CallbackUpcall {
             format!(".{clone_field} = {clone_fn}"),
         ];
         for (method, slot) in registration.methods().iter().zip(callback.methods()) {
-            let (trampoline, shim) = Self::slot(method, slot, &dispatch_class)?;
+            let (trampoline, shim) = Self::slot(method, slot, &dispatch_class, completions)?;
             vtable_init.push(format!(
                 ".{} = {}",
                 slot.name().as_str(),
@@ -215,10 +217,8 @@ impl CallbackUpcall {
         method: &CallbackMethod,
         slot: &c::CallbackSlot,
         dispatch_class: &str,
+        completions: &[CompletionUpcall],
     ) -> Result<(Trampoline, ShimFunction)> {
-        if slot.is_asynchronous() {
-            return Err(unsupported("asynchronous callback method"));
-        }
         if method.returns_closure() {
             return Err(unsupported("callback method returning a closure"));
         }
@@ -239,6 +239,7 @@ impl CallbackUpcall {
 
         let mut setup = Vec::new();
         let mut arguments = vec!["__cell.token()".to_owned()];
+        let mut failure_completion: Option<String> = None;
         let handle_name = slot.parameters()[0].name();
         for (position, argument) in method.jvm_arguments().iter().enumerate() {
             if let Some((parameter, _)) = argument.value() {
@@ -290,8 +291,19 @@ impl CallbackUpcall {
                 arguments.push(handle.handle().as_str().to_owned());
             } else if argument.closure_handle().is_some() {
                 return Err(unsupported("closure argument in callback method"));
-            } else if argument.completion().is_some() {
-                return Err(unsupported("asynchronous callback completion"));
+            } else if let Some(completion) = argument.completion() {
+                let (callback, context) =
+                    completion_names(slot).ok_or(Error::BrokenBridgeContract {
+                        bridge: NATIVE_IMAGE_BRIDGE,
+                        invariant: "asynchronous slot has a completion parameter group",
+                    })?;
+                let suffix = payload_suffix(completion.payload());
+                failure_completion = completions
+                    .iter()
+                    .find(|upcall| upcall.suffix() == suffix)
+                    .map(|upcall| format!("Lib.{}({callback}, {context});", upcall.failure_lib()));
+                arguments.push(format!("{callback}.rawValue()"));
+                arguments.push(format!("{context}.rawValue()"));
             } else {
                 return Err(Error::BrokenBridgeContract {
                     bridge: NATIVE_IMAGE_BRIDGE,
@@ -305,7 +317,21 @@ impl CallbackUpcall {
             arguments.join(", ")
         );
 
-        let body = trampoline_body(&call, &setup, &pointerized, slot.returns(), None)?;
+        let body = match (slot.is_asynchronous(), failure_completion) {
+            // An async slot returns before the work finishes; a Java failure has
+            // to be reported by completing the future Rust is already waiting on.
+            (true, Some(failure)) => std::iter::once("try {".to_owned())
+                .chain(setup.iter().map(|line| format!("    {line}")))
+                .chain([
+                    format!("    {call};"),
+                    "} catch (Throwable __failure) {".to_owned(),
+                    format!("    {failure}"),
+                    "}".to_owned(),
+                ])
+                .collect(),
+            (true, None) => return Err(unsupported("asynchronous callback completion")),
+            (false, _) => trampoline_body(&call, &setup, &pointerized, slot.returns(), None)?,
+        };
 
         let trampoline = Trampoline {
             entry_symbol: entry.clone(),

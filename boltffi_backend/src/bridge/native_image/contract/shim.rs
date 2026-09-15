@@ -97,13 +97,9 @@ impl Pointerized {
     }
 }
 
-/// Spells a C parameter declaration without a stray space before the name.
+/// Spells a C parameter declaration, wrapping function pointers around the name.
 pub(super) fn c_declaration(ty: &c::Type, name: &str) -> Result<String> {
-    let ty = TypeFragment::anonymous(ty)?.to_string();
-    Ok(match ty.ends_with('*') {
-        true => format!("{ty}{name}"),
-        false => format!("{ty} {name}"),
-    })
+    Ok(TypeFragment::declaration(ty, name)?.to_string())
 }
 
 /// One shim function definition in the generated glue file.

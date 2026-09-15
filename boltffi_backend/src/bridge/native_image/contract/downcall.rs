@@ -25,7 +25,8 @@ use crate::{
 };
 
 use super::{
-    super::NATIVE_IMAGE_BRIDGE, ClosureUpcall, JavaCType, ShimFunction, shim::Pointerized,
+    super::NATIVE_IMAGE_BRIDGE, ClosureUpcall, JavaCType, ShimFunction,
+    asynchronous::CONTINUATION_ADDRESS, shim::Pointerized,
 };
 
 /// Thread state transition performed around a `@CFunction` call.
@@ -78,6 +79,11 @@ pub struct WrapperParameter {
 }
 
 impl WrapperParameter {
+    /// Creates a Java parameter with an already-safe name.
+    pub(super) fn named(name: &str, java_type: impl Into<String>) -> Self {
+        Self::new(name, java_type)
+    }
+
     fn new(name: &str, java_type: impl Into<String>) -> Self {
         Self {
             name: java_identifier(name),
@@ -112,6 +118,21 @@ pub struct Wrapper {
 }
 
 impl Wrapper {
+    /// Creates a wrapper from already-rendered Java pieces.
+    pub(super) fn raw(
+        name: String,
+        params: Vec<WrapperParameter>,
+        returns: String,
+        body: Vec<String>,
+    ) -> Self {
+        Self {
+            name,
+            params,
+            returns,
+            body,
+        }
+    }
+
     /// Returns the Java method name (equal to the C export name).
     pub fn name(&self) -> &str {
         &self.name
@@ -383,6 +404,37 @@ impl Downcall {
         Ok(downcall)
     }
 
+    /// A `@CFunction` declaration with explicit parameters and a Java wrapper.
+    pub(super) fn glue(
+        lib_name: &str,
+        lib_params: &[(String, JavaCType)],
+        lib_returns: JavaCType,
+        transition: Transition,
+        wrapper: Option<Wrapper>,
+        extra_shim: Option<ShimFunction>,
+    ) -> Result<Self> {
+        Ok(Self {
+            lib_name: Identifier::parse(lib_name)?,
+            c_function: c::Function::new(lib_name, Vec::new(), c::Type::Void)?,
+            needs_shim: false,
+            transition,
+            lib_params: lib_params
+                .iter()
+                .map(|(name, ty)| {
+                    Ok(LibParameter {
+                        name: Identifier::parse(name)?,
+                        ty: *ty,
+                        c_type: c::Type::Void,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            lib_returns,
+            wrapper,
+            declares_lib: true,
+            extra_shim,
+        })
+    }
+
     /// A Java-only wrapper with no `@CFunction` of its own (lifecycle and writer helpers).
     pub(super) fn synthetic(wrapper: Wrapper) -> Self {
         Self {
@@ -497,6 +549,7 @@ impl WrapperBuilder<'_> {
         let mut parameters = self.parameters.iter();
         let mut success_out: Option<&SuccessOutReturn> = None;
         let mut writeback_buffer: Option<String> = None;
+        let mut completion_status = false;
         for group in groups {
             match group {
                 c::ParameterGroup::SuccessOut(_) => {
@@ -508,7 +561,15 @@ impl WrapperBuilder<'_> {
                     Self::success_out_storage(out, &mut marshalled)?;
                 }
                 c::ParameterGroup::CompletionStatusOut(_) => {
-                    return Err(Downcall::unsupported("async completion status"));
+                    marshalled.setup.push(
+                        "org.graalvm.nativeimage.c.type.CIntPointer __boltffi_status = StackValue.get(org.graalvm.nativeimage.c.type.CIntPointer.class);"
+                            .to_owned(),
+                    );
+                    marshalled
+                        .setup
+                        .push("__boltffi_status.write(0);".to_owned());
+                    marshalled.arguments.push("__boltffi_status".to_owned());
+                    completion_status = true;
                 }
                 c::ParameterGroup::CallbackCompletion(_) | c::ParameterGroup::ClosureReturn(_) => {
                     return Err(Error::BrokenBridgeContract {
@@ -582,15 +643,26 @@ impl WrapperBuilder<'_> {
                         NativeParameterKind::Closure(closure) => {
                             self.closure(closure, &mut params, &mut marshalled)?;
                         }
-                        NativeParameterKind::Continuation(_) => {
-                            return Err(Downcall::unsupported("async continuation parameter"));
+                        NativeParameterKind::Continuation(continuation) => {
+                            let token = WrapperParameter::new(continuation.name().as_str(), "long");
+                            marshalled
+                                .arguments
+                                .push(format!("newHandleCell({})", token.name));
+                            marshalled
+                                .arguments
+                                .push(format!("Lib.{CONTINUATION_ADDRESS}()"));
+                            params.push(token);
                         }
                     }
                 }
             }
         }
-        let (returns, mut body, tail) =
-            self.return_shape(&mut marshalled, success_out, writeback_buffer.as_deref())?;
+        let (returns, mut body, tail) = self.return_shape(
+            &mut marshalled,
+            success_out,
+            writeback_buffer.as_deref(),
+            completion_status,
+        )?;
         let mut statements = marshalled.setup;
         statements.append(&mut body);
         for _ in 0..marshalled.pins {
@@ -782,6 +854,7 @@ impl WrapperBuilder<'_> {
         marshalled: &mut Marshalled,
         success_out: Option<&SuccessOutReturn>,
         writeback_buffer: Option<&str>,
+        completion_status: bool,
     ) -> Result<(String, Vec<String>, Vec<String>)> {
         let returns = self.returns;
         let mut body = Vec::new();
@@ -797,7 +870,8 @@ impl WrapperBuilder<'_> {
             NativeReturn::EncodedErrorValue(out) => Self::success_java_type(out.success())?,
             NativeReturn::Callback(_) => "long".to_owned(),
         };
-        let needs_result_local = marshalled.pins > 0 && result_type != "void";
+        let needs_result_local =
+            (marshalled.pins > 0 || completion_status) && result_type != "void";
         let finish = |body: &mut Vec<String>, tail: &mut Vec<String>, value: String| {
             if needs_result_local {
                 body.push(format!("__result = {value};"));
@@ -881,6 +955,10 @@ impl WrapperBuilder<'_> {
             }
         }
         let _ = success_out;
+        if completion_status {
+            // The poll call reports failure through bridge-owned status storage.
+            tail.insert(0, "checkStatus(__boltffi_status.read());".to_owned());
+        }
         if needs_result_local {
             marshalled
                 .setup

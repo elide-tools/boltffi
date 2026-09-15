@@ -299,6 +299,12 @@ final class BoltFFINativeImage {
         return copyBytes(pointer, size);
     }
 
+    static void checkRecordLength(byte[] value, int size) {
+        if (value == null || value.length != size) {
+            throw new IllegalArgumentException("BoltFFI record byte array length did not match the C record size");
+        }
+    }
+
     static void writeRecord(PointerBase pointer, byte[] value, int size) {
         if (value == null || value.length != size) {
             throw new IllegalArgumentException("BoltFFI record byte array length did not match the C record size");
