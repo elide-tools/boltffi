@@ -148,6 +148,14 @@ private object DirectVectorCodec {
 internal class WireReader(private val bytes: ByteArray) {
     private var position = 0
 
+    fun skip(count: Int): WireReader {
+        if (count > bytes.size - position) {
+            throw IndexOutOfBoundsException("Wire read past the end of the payload")
+        }
+        position += count
+        return this
+    }
+
     fun readBool(): Boolean = readI8() != 0.toByte()
 
     fun readI8(): Byte {
@@ -474,6 +482,11 @@ internal class WireWriter(initialCapacity: Int) {
         writeBytesRaw(value)
     }
 
+    fun pad(count: Int): WireWriter {
+        repeat(count) { writeI8(0) }
+        return this
+    }
+
     fun writeBooleanArray(values: BooleanArray) {
         writeU32(values.size.toUInt())
         values.forEach { writeBool(it) }
@@ -794,6 +807,7 @@ internal class BoltFfiStreamContext(
 
 @Suppress("FunctionName")
 private object Native {
+    fun ensureInitialized() {}
     init {
         val androidLibrary = "boltffi"
         val desktopPreferredLibrary = "boltffi_jni"
@@ -1010,6 +1024,11 @@ class Engine internal constructor(internal val handle: Long) : AutoCloseable {
         if (__boltffi_closed.compareAndSet(false, true)) {
             Native.boltffi_release_class_demo_engine(handle)
         }
+    }
+
+    internal fun __boltffiTakeHandle(): Long {
+        check(__boltffi_closed.compareAndSet(false, true)) { "Engine is closed" }
+        return handle
     }
 
     internal fun boltffiHandle(): Long {

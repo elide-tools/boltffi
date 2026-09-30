@@ -18,6 +18,7 @@ use crate::{
             default_value::DefaultExpression,
             field::EncodedField,
             function::{ExportedCall, ExportedCallRenderer, ReceiverCarrier, ReceiverMutation},
+            signature::validate_exception_fields,
         },
         syntax::{ArgumentList, Expression, Identifier, Statement, TypeName},
     },
@@ -36,6 +37,7 @@ pub struct Record {
     documentation: Documentation,
     body: RecordBody,
     error: bool,
+    error_message: Option<Identifier>,
     fields: Vec<Field>,
     constants: AssociatedConstants,
     initializers: Vec<ExportedCall>,
@@ -48,6 +50,7 @@ enum RecordBody {
     Direct {
         size: u64,
         wire_size: Option<Expression>,
+        trailing_padding: u64,
     },
     Encoded {
         size: Expression,
@@ -80,11 +83,21 @@ impl Record {
         bridge: &JniBridgeContract,
         context: &RenderContext<Native>,
     ) -> Result<Self> {
-        match declaration {
+        let mut record = match declaration {
             RecordDecl::Direct(record) => Self::from_direct(record, host, bridge, context),
             RecordDecl::Encoded(record) => Self::from_encoded(record, host, bridge, context),
             _ => Err(KotlinHost::unsupported("unknown record declaration")),
+        }?;
+        if record.error {
+            record.error_message = validate_exception_fields(
+                record.name(),
+                record
+                    .fields()
+                    .iter()
+                    .map(|field| (field.name(), field.ty())),
+            )?;
         }
+        Ok(record)
     }
 
     pub fn render(self) -> Result<Emitted> {
@@ -121,8 +134,30 @@ impl Record {
         }
     }
 
+    /// Bytes the C layout carries after the last field; wire codecs must
+    /// consume them to stay aligned with the Rust runtime's blit.
+    pub fn trailing_padding(&self) -> Option<u64> {
+        match self.body {
+            RecordBody::Direct {
+                trailing_padding, ..
+            } if trailing_padding > 0 && self.wire_size().is_some() => Some(trailing_padding),
+            _ => None,
+        }
+    }
+
     pub fn encoded(&self) -> bool {
         matches!(self.body, RecordBody::Encoded { .. })
+    }
+
+    fn field_offset(record: &DirectRecordDecl<Native>, field: &DirectFieldDecl) -> Result<u64> {
+        Ok(record
+            .layout()
+            .field(field.key())
+            .ok_or(KotlinHost::broken_bridge_contract(
+                "direct record field layout was not found",
+            ))?
+            .offset()
+            .get())
     }
 
     pub fn error(&self) -> bool {
@@ -130,10 +165,11 @@ impl Record {
     }
 
     pub fn error_message(&self) -> Option<&Identifier> {
-        self.fields
-            .iter()
-            .find(|field| field.is_string_message())
-            .map(|field| field.name())
+        self.error_message.as_ref()
+    }
+
+    pub fn overrides_message(&self, name: &Identifier) -> bool {
+        self.error_message.as_ref() == Some(name)
     }
 
     pub fn fields(&self) -> &[Field] {
@@ -220,34 +256,44 @@ impl Record {
         let buffer = Identifier::parse("buffer")?;
         let reader = Identifier::parse("reader")?;
         let writer = Identifier::parse("writer")?;
-        let wire_size = record
-            .fields()
-            .iter()
-            .map(|field| KotlinPrimitive::new(field.ty().primitive()).wire_size())
-            .try_fold(0_u64, |total, field_size| {
-                field_size.map(|field_size| total + field_size)
-            })?;
+        let size = record.layout().size().get();
+        let (fields, end) = record.fields().iter().try_fold(
+            (Vec::new(), 0_u64),
+            |(mut fields, end), field| -> Result<(Vec<Field>, u64)> {
+                let offset = Self::field_offset(record, field)?;
+                let padding = offset
+                    .checked_sub(end)
+                    .ok_or(KotlinHost::broken_bridge_contract(
+                        "direct record field layout moves backwards",
+                    ))?;
+                fields.push(Field::from_direct(
+                    field, record, padding, &buffer, &reader, &writer, context,
+                )?);
+                let end = offset + KotlinPrimitive::new(field.ty().primitive()).wire_size()?;
+                Ok((fields, end))
+            },
+        )?;
         Ok(Self {
             name: Name::new(record.name()).type_name(),
             documentation: Documentation::new(record.meta().doc()),
             body: RecordBody::Direct {
-                size: record.layout().size().get(),
-                wire_size: record
-                    .is_codec_payload()
-                    .then(|| Expression::integer(wire_size)),
+                size,
+                wire_size: record.is_codec_payload().then(|| Expression::integer(size)),
+                trailing_padding: size.checked_sub(end).ok_or(
+                    KotlinHost::broken_bridge_contract(
+                        "direct record size is smaller than its fields",
+                    ),
+                )?,
             },
             error: record.is_error_payload(),
+            error_message: None,
             constants: AssociatedConstants::from_owner(
                 ConstantOwner::Record(record.id()),
                 host,
                 Some(bridge),
                 context,
             )?,
-            fields: record
-                .fields()
-                .iter()
-                .map(|field| Field::from_direct(field, record, &buffer, &reader, &writer, context))
-                .collect::<Result<Vec<_>>>()?,
+            fields,
             initializers: Self::initializer_calls(record.initializers(), host, bridge, context)?,
             static_methods: Self::methods(record.methods(), None, host, bridge, context)?,
             instance_methods: Self::methods(
@@ -287,6 +333,7 @@ impl Record {
             documentation: Documentation::new(record.meta().doc()),
             body: RecordBody::Encoded { size },
             error: record.is_error_payload(),
+            error_message: None,
             constants: AssociatedConstants::from_owner(
                 ConstantOwner::Record(record.id()),
                 host,
@@ -421,10 +468,6 @@ impl Field {
         &self.documentation
     }
 
-    pub fn is_string_message(&self) -> bool {
-        self.name.to_string() == "message" && self.ty.to_string() == "String"
-    }
-
     pub fn ty(&self) -> &TypeName {
         &self.ty
     }
@@ -456,20 +499,14 @@ impl Field {
     fn from_direct(
         field: &DirectFieldDecl,
         record: &DirectRecordDecl<Native>,
+        padding: u64,
         buffer: &Identifier,
         reader: &Identifier,
         writer: &Identifier,
         context: &RenderContext<Native>,
     ) -> Result<Self> {
         let name = Self::identifier(field.key())?;
-        let offset = record
-            .layout()
-            .field(field.key())
-            .ok_or(KotlinHost::broken_bridge_contract(
-                "direct record field layout was not found",
-            ))?
-            .offset()
-            .get();
+        let offset = Record::field_offset(record, field)?;
         let base = Identifier::parse("offset")?;
         let position = match offset {
             0 => Expression::identifier(base),
@@ -482,11 +519,26 @@ impl Field {
             .default()
             .map(|value| DefaultExpression::render(&TypeRef::Primitive(primitive), value, context))
             .transpose()?;
+        // The Rust runtime blits the C layout, padding included, so the wire
+        // codecs step over the gap before each field.
+        let padded = |cursor: &Identifier, method: &str| -> Result<Expression> {
+            let cursor = Expression::identifier(cursor.clone());
+            Ok(match padding {
+                0 => cursor,
+                _ => Expression::call(
+                    cursor,
+                    Identifier::parse(method)?,
+                    [Expression::integer(padding)]
+                        .into_iter()
+                        .collect::<ArgumentList>(),
+                ),
+            })
+        };
         Ok(Self {
             documentation: Documentation::new(field.meta().doc()),
             ty: KotlinPrimitive::new(primitive).api_type()?,
             read: Expression::call(
-                Expression::identifier(reader.clone()),
+                padded(reader, "skip")?,
                 Identifier::parse(format!("read{wire_method_suffix}"))?,
                 ArgumentList::default(),
             ),
@@ -494,7 +546,7 @@ impl Field {
                 KotlinPrimitive::new(primitive).buffer_read_at(buffer, position.clone())?,
             ),
             write: Statement::expression(Expression::call(
-                Expression::identifier(writer.clone()),
+                padded(writer, "pad")?,
                 Identifier::parse(format!("write{wire_method_suffix}"))?,
                 [Expression::identifier(name.clone())]
                     .into_iter()

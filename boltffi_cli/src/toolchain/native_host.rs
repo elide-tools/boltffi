@@ -604,7 +604,7 @@ fn current_host_windows_build_target(
     validate_windows_rust_target_triple(&target_triple, target).ok()
 }
 
-fn rustc_host_triple(toolchain_selector: Option<&str>) -> Result<String> {
+pub fn rustc_host_triple(toolchain_selector: Option<&str>) -> Result<String> {
     let mut command = Command::new("rustc");
     if let Some(toolchain_selector) = toolchain_selector {
         command.arg(toolchain_selector);
@@ -2664,34 +2664,6 @@ unix
             }
             other => panic!("unexpected error: {other:?}"),
         }
-    }
-
-    #[test]
-    fn includes_global_cargo_config_candidates() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time went backwards")
-            .as_nanos();
-        let temp_root =
-            std::env::temp_dir().join(format!("boltffi-global-cargo-config-test-{unique}"));
-        let cargo_home = temp_root.join("cargo-home");
-        let home_dir = temp_root.join("home");
-        fs::create_dir_all(&cargo_home).expect("create cargo home");
-        fs::create_dir_all(home_dir.join(".cargo")).expect("create home .cargo");
-        fs::write(cargo_home.join("config.toml"), []).expect("write cargo home config");
-        fs::write(home_dir.join(".cargo").join("config"), []).expect("write home cargo config");
-
-        let candidates = cargo_config_file_candidates_with_inputs(
-            Vec::new(),
-            None,
-            Some(cargo_home.clone()),
-            Some(home_dir.clone()),
-        );
-
-        assert!(candidates.contains(&cargo_home.join("config.toml")));
-        assert!(candidates.contains(&home_dir.join(".cargo").join("config")));
-
-        fs::remove_dir_all(&temp_root).expect("cleanup temp dir");
     }
 
     #[test]

@@ -132,6 +132,7 @@ impl JniBridgeContract {
             header_style,
             free_buffer: Identifier::parse(c_bridge.support().buffer_free()?.name())?,
             buffer_with_len: Identifier::parse(c_bridge.support().buffer_with_len()?.name())?,
+            callback_error: Identifier::parse(c_bridge.support().callback_error()?.name())?,
             callback_handle_lifecycle,
             callbacks,
             callback_completions,

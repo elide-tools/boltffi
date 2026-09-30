@@ -15,7 +15,7 @@ use self::args::CargoArguments;
 pub(crate) use self::library::SelectedLibrary;
 #[cfg(test)]
 pub(crate) use self::metadata::CargoCrateType;
-pub(crate) use self::metadata::CargoMetadata;
+pub(crate) use self::metadata::{CargoMetadata, CargoMetadataPackage};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Cargo {
@@ -67,6 +67,10 @@ impl Cargo {
     pub(crate) fn configured_build_target(&self) -> Option<String> {
         self.arguments
             .configured_build_target(&self.working_directory)
+    }
+
+    pub fn offline(&self) -> bool {
+        self.arguments.offline(&self.working_directory)
     }
 
     pub(crate) fn effective_package_selector(

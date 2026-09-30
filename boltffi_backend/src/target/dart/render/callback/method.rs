@@ -24,9 +24,25 @@ use super::super::super::{
     syntax::{Expression, Identifier, Parameter, TypeFragment},
     type_name,
 };
+use super::super::class::{OwnedCallTemplate, OwnedClassArgument};
 use super::super::shim;
 use super::super::{Documentation, indent};
-use super::parameter::{CallbackParameter, group_indices};
+use super::parameter::{CallbackParameter, ReceivedClass, group_indices};
+
+#[derive(Template)]
+#[template(path = "target/dart/callback_class_arguments.dart", escape = "none")]
+struct ReceivedClassesTemplate<'call> {
+    classes: Vec<&'call ReceivedClass>,
+    body: &'call str,
+}
+
+#[derive(Template)]
+#[template(path = "target/dart/callback_argument.dart", escape = "none")]
+struct ArgumentBindingTemplate<'argument> {
+    name: &'argument Identifier,
+    ty: &'argument TypeFragment,
+    value: &'argument str,
+}
 
 #[derive(Template)]
 #[template(path = "target/dart/callback_interface_method.dart", escape = "none")]
@@ -193,7 +209,7 @@ impl CallbackMethod {
             let fast_source = (
                 None,
                 format!(
-                    "$$ffi.Pointer.fromFunction<{native_signature}>({callback_name}Bridge.{entry_name}{exceptional})"
+                    "$$ffi.Pointer.fromFunction<{native_signature}>(_{callback_name}Bridge.{entry_name}{exceptional})"
                 ),
             );
             let fast_declaration = format!(
@@ -415,11 +431,36 @@ fn render_sync_entry(
             .iter()
             .flat_map(|parameter| parameter.entry_setup().iter().cloned()),
     );
-    let arguments = parameters
+    let classes = parameters
         .iter()
-        .map(CallbackParameter::entry_argument)
-        .collect::<Vec<_>>()
-        .join(", ");
+        .filter_map(CallbackParameter::received_class)
+        .collect::<Vec<_>>();
+    let arguments = if classes.is_empty() {
+        parameters
+            .iter()
+            .map(|parameter| parameter.entry_argument().to_owned())
+            .collect::<Vec<_>>()
+    } else {
+        let arguments = parameters
+            .iter()
+            .enumerate()
+            .map(|(index, parameter)| {
+                let name = Identifier::parse(format!("_l$argument{index}"))?;
+                setup.push(
+                    ArgumentBindingTemplate {
+                        name: &name,
+                        ty: parameter.public_type(),
+                        value: parameter.entry_argument(),
+                    }
+                    .render()?,
+                );
+                Ok(name.to_string())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        setup.push("_l$classesDelivered = true;".to_owned());
+        arguments
+    }
+    .join(", ");
     let call = format!("implementation.{method}({arguments})");
     match declaration.callable().error() {
         ErrorDecl::None(_) => setup.extend(render_infallible_entry_return(
@@ -442,7 +483,16 @@ fn render_sync_entry(
         }
         _ => return super::unsupported("Dart callback error channel"),
     }
-    Ok(setup.join("\n"))
+    let body = setup.join("\n");
+    if classes.is_empty() {
+        Ok(body)
+    } else {
+        Ok(ReceivedClassesTemplate {
+            classes,
+            body: &body,
+        }
+        .render()?)
+    }
 }
 
 pub fn render_infallible_entry_return(
@@ -567,12 +617,24 @@ pub fn render_fallible_entry_return(
         context,
     )?;
     failure.push("return _l$errorBuffer;".to_owned());
-    Ok(vec![format!(
-        "try {{\n{}\n}} on {} catch ({}) {{\n{}\n}}",
-        indent(&success.join("\n"), 2),
+    let on_catch = format!(
+        "on {} catch ({}) {{\n{}\n}}",
         error_binding.ty,
         error_binding.name,
         indent(&failure.join("\n"), 2),
+    );
+    // `on Object` already catches every throwable, so the unexpected-error
+    // fallback is unreachable for untyped (string) payloads.
+    let catches = if error_binding.ty.as_str() == "Object" {
+        on_catch
+    } else {
+        format!(
+            "{on_catch} catch (_l$unexpectedError) {{\n  return _f$encodeUnexpectedCallbackError(_l$unexpectedError);\n}}"
+        )
+    };
+    Ok(vec![format!(
+        "try {{\n{}\n}} {catches}",
+        indent(&success.join("\n"), 2),
     )])
 }
 
@@ -602,12 +664,27 @@ fn render_sync_proxy(
     arguments[0] = Some("_handle.handle".to_owned());
     populate_source_arguments(&mut arguments, slot, parameters)?;
 
+    let owned = parameters
+        .iter()
+        .filter_map(CallbackParameter::owned_class)
+        .collect::<Vec<_>>();
     let call = match declaration.callable().error() {
         ErrorDecl::None(_) => {
             let arguments = complete_arguments(arguments)?;
+            let invocation = format!("_l$invoke({})", arguments.join(", "));
+            let invocation = if owned.is_empty() {
+                invocation
+            } else {
+                OwnedCallTemplate {
+                    owned,
+                    invocation,
+                    returns_value: !matches!(slot.returns(), CBridgeType::Void),
+                }
+                .render()?
+            };
             render_infallible_proxy_return(
                 declaration.callable().returns().plan(),
-                &format!("_l$invoke({})", arguments.join(", ")),
+                &invocation,
                 bridge,
                 context,
             )?
@@ -619,7 +696,7 @@ fn render_sync_proxy(
             slot.return_parameter_groups(),
             slot,
             "_l$invoke",
-            &[],
+            &owned,
             arguments,
             bridge,
             context,
@@ -671,7 +748,7 @@ pub fn render_fallible_proxy_return(
     return_groups: &[ParameterGroup],
     parameters: &impl NativeParameterSource,
     invoke: &str,
-    leading_arguments: &[String],
+    owned: &[&OwnedClassArgument],
     mut arguments: Vec<Option<String>>,
     bridge: &CBridgeContract,
     context: &RenderContext<Native>,
@@ -703,15 +780,18 @@ pub fn render_fallible_proxy_return(
         .into_iter()
         .collect::<Vec<_>>();
     let arguments = complete_arguments(arguments)?;
-    let arguments = leading_arguments
-        .iter()
-        .cloned()
-        .chain(arguments)
-        .collect::<Vec<_>>();
-    statements.push(format!(
-        "final _l$errorBuffer = {invoke}({});",
-        arguments.join(", ")
-    ));
+    let invocation = format!("{invoke}({})", arguments.join(", "));
+    let invocation = if owned.is_empty() {
+        invocation
+    } else {
+        OwnedCallTemplate {
+            owned: owned.to_vec(),
+            invocation,
+            returns_value: true,
+        }
+        .render()?
+    };
+    statements.push(format!("final _l$errorBuffer = {invocation};"));
     let error_decode = error_codec
         .read_plan()
         .render_with(&mut Reader::new("_l$errorReader", context))?
@@ -1053,6 +1133,7 @@ fn async_success_payload(
     };
     match (plan, payload) {
         (ReturnPlan::Void, CBridgeType::Buffer) => Ok(vec![
+            format!("{call};"),
             "final _l$payloadBuffer = $$ffi.Struct.create<_$$BoltFFIBuf>();".to_owned(),
         ]),
         (ReturnPlan::DirectViaReturnSlot { ty }, CBridgeType::Buffer)
@@ -1113,6 +1194,20 @@ fn async_proxy_success(
     Ok(match plan {
         ReturnPlan::DirectViaReturnSlot { ty } | ReturnPlan::DirectViaOutPointer { ty } => {
             let decoded = match (ty, payload_ty) {
+                (DirectValueType::Primitive(primitive), Some(CBridgeType::Buffer)) => format!(
+                    "_$$BoltWireDecoder(_$$BoltBufReader.fromSpan({payload}.ptr, {payload}.len)).{}()",
+                    primitive_read_method(*primitive)
+                ),
+                (DirectValueType::Enum(id), Some(CBridgeType::Buffer)) => {
+                    let Some(EnumDecl::CStyle(enumeration)) = context.enumeration(*id) else {
+                        return super::unsupported("Dart direct callback enum wire decoding");
+                    };
+                    format!(
+                        "{}._m$fromDiscriminant(_$$BoltWireDecoder(_$$BoltBufReader.fromSpan({payload}.ptr, {payload}.len)).{}())",
+                        type_name::direct_value(ty, context)?,
+                        primitive_read_method(enumeration.repr().primitive())
+                    )
+                }
                 (DirectValueType::Record(_), Some(CBridgeType::Buffer)) => format!(
                     "{}._m$wireDecode(_$$BoltWireDecoder(_$$BoltBufReader.fromSpan({payload}.ptr, {payload}.len)))",
                     type_name::direct_value(ty, context)?
@@ -1306,7 +1401,7 @@ fn encode_direct_vector(
             let native = native::direct_record_struct(bridge, *record)?;
             statements.extend([
                 format!("final {prefix}Storage = _$$BoltCallocPtr<{native}>.alloc($$ffi.sizeOf<{native}>() * _l$value.length);"),
-                format!("for (var _l$index = 0; _l$index < _l$value.length; _l$index++) {{ _l$value[_l$index]._m$writeStruct({prefix}Storage.ptr.elementAt(_l$index)); }}"),
+                format!("for (var _l$index = 0; _l$index < _l$value.length; _l$index++) {{ _l$value[_l$index]._m$writeStruct(({prefix}Storage.ptr + _l$index)); }}"),
                 format!("final {prefix}Buffer = _f$buffer_symbol({prefix}Storage.ptr.cast<$$ffi.Uint8>(), _l$value.length * $$ffi.sizeOf<{native}>());")
                     .replace("buffer_symbol", bridge.support().buffer_from_bytes()?.name()),
             ]);
@@ -1404,7 +1499,7 @@ fn direct_vector_decode_statements(
             vec![
                 format!("final _l$count = {buffer}.len ~/ $$ffi.sizeOf<{native}>();"),
                 format!(
-                    "final {value} = List<{public}>.generate(_l$count, (_l$index) => {public}._m$fromStruct({buffer}.ptr.cast<{native}>().elementAt(_l$index).ref));"
+                    "final {value} = List<{public}>.generate(_l$count, (_l$index) => {public}._m$fromStruct(({buffer}.ptr.cast<{native}>() + _l$index).ref));"
                 ),
             ]
         }
@@ -1457,7 +1552,7 @@ fn handle_into_native(
             _ => return super::unsupported("Dart callback class return presence"),
         }),
         HandleTarget::Callback(id) => Ok(format!(
-            "{}Bridge.create({expression})",
+            "_{}Bridge.create({expression})",
             callback_type(*id, context)?
         )),
         HandleTarget::Stream(_) => super::unsupported("Dart callback stream return"),
@@ -1481,9 +1576,9 @@ fn handle_from_native(
             _ => return super::unsupported("Dart callback class proxy return presence"),
         }),
         HandleTarget::Callback(_) => Ok(match presence {
-            HandlePresence::Required => format!("{required}Bridge.wrap({expression})"),
+            HandlePresence::Required => format!("_{required}Bridge.wrap({expression})"),
             HandlePresence::Nullable => {
-                format!("{expression}.handle == 0 ? null : {required}Bridge.wrap({expression})")
+                format!("{expression}.handle == 0 ? null : _{required}Bridge.wrap({expression})")
             }
             _ => return super::unsupported("Dart callback proxy return presence"),
         }),

@@ -124,6 +124,14 @@ private object DirectVectorCodec {
 internal class WireReader(private val bytes: ByteArray) {
     private var position = 0
 
+    fun skip(count: Int): WireReader {
+        if (count > bytes.size - position) {
+            throw IndexOutOfBoundsException("Wire read past the end of the payload")
+        }
+        position += count
+        return this
+    }
+
     fun readBool(): Boolean = readI8() != 0.toByte()
 
     fun readI8(): Byte {
@@ -450,6 +458,11 @@ internal class WireWriter(initialCapacity: Int) {
         writeBytesRaw(value)
     }
 
+    fun pad(count: Int): WireWriter {
+        repeat(count) { writeI8(0) }
+        return this
+    }
+
     fun writeBooleanArray(values: BooleanArray) {
         writeU32(values.size.toUInt())
         values.forEach { writeBool(it) }
@@ -628,6 +641,7 @@ private inline fun <K, V> Map<K, V>.wireSize(
 
 @Suppress("FunctionName")
 private object Native {
+    fun ensureInitialized() {}
     init {
         val androidLibrary = "boltffi"
         val desktopPreferredLibrary = "boltffi_jni"

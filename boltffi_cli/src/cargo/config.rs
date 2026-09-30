@@ -1,5 +1,36 @@
 use std::path::{Component, Path, PathBuf};
 
+pub fn offline(cargo_args: &[String], working_directory: &Path) -> bool {
+    cargo_args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "--offline" | "--frozen"))
+        || extract_cargo_config_args(cargo_args)
+            .into_iter()
+            .rev()
+            .find_map(|argument| {
+                parse_inline_config_value(&argument, &["net", "offline"])
+                    .or_else(|| {
+                        let path = resolve_cargo_config_path(&argument, Some(working_directory));
+                        let contents = std::fs::read_to_string(path).ok()?;
+                        let configuration: toml::Value = toml::from_str(&contents).ok()?;
+                        configuration.get("net")?.get("offline").cloned()
+                    })
+                    .and_then(|value| value.as_bool())
+            })
+            .or_else(|| std::env::var("CARGO_NET_OFFLINE").ok()?.parse().ok())
+            .or_else(|| {
+                cargo_config_file_candidates(&[], Some(working_directory))
+                    .into_iter()
+                    .filter(|path| path.extension().is_none() || !path.with_extension("").is_file())
+                    .find_map(|path| {
+                        let contents = std::fs::read_to_string(path).ok()?;
+                        let configuration: toml::Value = toml::from_str(&contents).ok()?;
+                        configuration.get("net")?.get("offline")?.as_bool()
+                    })
+            })
+            .unwrap_or(false)
+}
+
 pub(crate) fn configured_build_target(
     cargo_args: &[String],
     working_directory: Option<&Path>,
@@ -113,12 +144,8 @@ pub(crate) fn cargo_config_file_candidates_with_inputs(
     });
 
     resolved_cargo_home
+        .or_else(|| home_directory.map(|home_directory| home_directory.join(".cargo")))
         .into_iter()
-        .chain(
-            home_directory
-                .into_iter()
-                .map(|home_directory| home_directory.join(".cargo")),
-        )
         .flat_map(|config_root| {
             ["config.toml", "config"]
                 .into_iter()
@@ -368,10 +395,33 @@ mod tests {
 
     use super::{
         cargo_config_file_candidates_with_inputs, cargo_config_search_roots,
-        configured_build_target, extract_cargo_config_args, parse_build_target_from_config_file,
-        parse_build_target_from_inline_config, parse_profile_debug_from_config_file,
-        parse_profile_debug_from_inline_config,
+        configured_build_target, extract_cargo_config_args, offline,
+        parse_build_target_from_config_file, parse_build_target_from_inline_config,
+        parse_profile_debug_from_config_file, parse_profile_debug_from_inline_config,
     };
+
+    #[test]
+    fn offline_configuration_starts_in_the_working_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let selected_crate = directory.path().join("member");
+        fs::create_dir_all(selected_crate.join(".cargo")).unwrap();
+        fs::create_dir(directory.path().join(".cargo")).unwrap();
+        fs::write(
+            directory.path().join(".cargo/config.toml"),
+            "[net]\noffline = true\n",
+        )
+        .unwrap();
+        fs::write(
+            selected_crate.join(".cargo/config.toml"),
+            "[net]\noffline = false\n",
+        )
+        .unwrap();
+        let arguments = vec![
+            "--manifest-path".to_owned(),
+            selected_crate.join("Cargo.toml").display().to_string(),
+        ];
+        assert!(offline(&arguments, directory.path()));
+    }
 
     #[test]
     fn extracts_cargo_config_args_from_split_and_inline_flags() {
@@ -521,6 +571,41 @@ debug = "line-directives-only"
 
         assert!(candidates.contains(&workspace_directory.join(".cargo").join("config.toml")));
         assert!(candidates.contains(&home_directory.join(".cargo").join("config")));
+    }
+
+    #[test]
+    fn explicit_cargo_home_replaces_the_default_configuration_directory() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("boltffi-explicit-cargo-home-{unique}"));
+        let workspace = root.join("workspace");
+        let home_directory = root.join("home");
+        let cargo_home = root.join("cargo");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::create_dir_all(home_directory.join(".cargo")).expect("create default cargo home");
+        fs::create_dir_all(&cargo_home).expect("create explicit cargo home");
+        fs::write(
+            home_directory.join(".cargo/config.toml"),
+            "[profile.dev]\ndebug = true\n",
+        )
+        .expect("write default configuration");
+        fs::write(
+            cargo_home.join("config.toml"),
+            "[profile.dev]\ndebug = false\n",
+        )
+        .expect("write explicit configuration");
+
+        let candidates = cargo_config_file_candidates_with_inputs(
+            vec![workspace.clone()],
+            Some(workspace),
+            Some(cargo_home.clone()),
+            Some(home_directory),
+        );
+
+        assert_eq!(candidates, vec![cargo_home.join("config.toml")]);
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]
